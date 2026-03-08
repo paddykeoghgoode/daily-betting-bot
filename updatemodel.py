@@ -2587,9 +2587,11 @@ if all_value_bets:
 
     print(f"\nTotal value bets found: {len(all_value_bets)}")
 
-    # Optional HTML output
+# Optional HTML output
     if args.html:
-        out_file = write_html_report(all_value_bets, all_fixture_preds, out_path=args.html_out)
+        # Force the output to 'index.html' so it works with GitHub Pages
+        target_path = "index.html" 
+        out_file = write_html_report(all_value_bets, all_fixture_preds, out_path=target_path)
         print(f"\nHTML report written to: {out_file}")
 else:
     print("No value bets found.")
