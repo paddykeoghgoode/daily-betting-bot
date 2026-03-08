@@ -2,14 +2,14 @@ name: Daily Betting Predictions
 
 on:
   schedule:
-    - cron: '0 8 * * *'
-  workflow_dispatch:
+    - cron: '0 9 * * *' # Runs at 9:00 AM UTC
+  workflow_dispatch: # Allows you to run it manually
 
 permissions:
-  contents: write # Important: Allows the bot to write the HTML to your repo
+  contents: write
 
 jobs:
-  build:
+  run-and-deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -23,13 +23,11 @@ jobs:
       - name: Install Dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Betting Model
+      - name: Run Model
         run: |
           mkdir -p output/models
-          # We tell the script to name the output 'index.html' for the website
+          # The --html flag triggers the code block you just edited
           python updatemodel.py --html --refresh
-          # Rename the output to index.html so it loads as the homepage
-          mv predictions_*.html index.html || mv *.html index.html
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
