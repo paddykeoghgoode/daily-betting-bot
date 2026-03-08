@@ -2,7 +2,8 @@ name: Daily Betting Predictions
 
 on:
   schedule:
-    - cron: '0 9 * * *' # Runs at 9:00 AM UTC
+    # Runs at 09:00 UTC every day
+    - cron: '0 9 * * *'
   workflow_dispatch: # Allows you to run it manually
 
 permissions:
@@ -21,17 +22,22 @@ jobs:
           python-version: '3.10'
 
       - name: Install Dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run Model
         run: |
+          pip install pandas numpy scipy requests scikit-learn openpyxl
+
+      - name: Run Betting Model
+        run: |
+          # 1. Create the output folder so the script finds it
           mkdir -p output/models
-          # The --html flag triggers the code block you just edited
-          python updatemodel.py --html --refresh --html-out ./index.html
+          
+          # 2. Run script saving the HTML into that folder
+          # We use output/index.html so os.path.dirname returns 'output'
+          python updatemodel.py --html --refresh --html-out output/index.html
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: .
+          # This takes everything inside 'output' and puts it on the web
+          publish_dir: ./output
           publish_branch: gh-pages
