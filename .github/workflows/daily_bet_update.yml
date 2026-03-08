@@ -27,7 +27,7 @@ jobs:
         run: |
           mkdir -p output/models
           # The --html flag triggers the code block you just edited
-          python updatemodel.py --html --refresh --html_out "index.html"
+          python updatemodel.py --html --refresh --html-out index.html
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
