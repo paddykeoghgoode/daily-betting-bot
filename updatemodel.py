@@ -2590,7 +2590,7 @@ if all_value_bets:
 # Optional HTML output
     if args.html:
         # Force the output to 'index.html' so it works with GitHub Pages
-        target_path = "index.html" 
+        target_path = "output/index.html"
         out_file = write_html_report(all_value_bets, all_fixture_preds, out_path=target_path)
         print(f"\nHTML report written to: {out_file}")
 else:
