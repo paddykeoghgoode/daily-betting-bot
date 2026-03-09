@@ -1476,6 +1476,19 @@ def write_html_report(all_value_bets, all_fixtures=None, out_path="output/value_
             cls = 'low'
         return label, cls, score
 
+    def _format_edge_line(b):
+        model_prob = float(b.get('model_prob', 0) or 0)
+        market_prob = float(b.get('market_prob', 0) or 0)
+        edge_pp = float(b.get('edge_pp', 0) or 0)
+        if model_prob <= 0 and market_prob <= 0:
+            return ""
+        edge_cls = 'edge-pos' if edge_pp >= 0 else 'edge-neg'
+        return (
+            f"<div class='muted small' style='margin-top:4px'>"
+            f"Model P: <b>{model_prob*100:.1f}%</b> · Market Implied: <b>{market_prob*100:.1f}%</b> · "
+            f"Edge: <b class='{edge_cls}'>{edge_pp:+.1f}pp</b></div>"
+        )
+
     def _render_recent_form_table(fix):
         recent = fix.get('recent_form', {}) or {}
         home = recent.get('home', {}) or {}
@@ -1626,8 +1639,9 @@ h1{margin:0 0 10px 0; font-size:28px; letter-spacing:0.2px}
   background:linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.03));
   box-shadow:var(--shadow);
 }
-.controls{display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end;}
+.controls{display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:12px; align-items:flex-end;}
 .ctl{display:flex; flex-direction:column; gap:6px}
+.ctl.search-ctl{grid-column:span 2}
 label{font-size:12px; color:#c4cfe5}
 input,select{
   padding:10px 10px;
@@ -1635,7 +1649,8 @@ input,select{
   border:1px solid rgba(255,255,255,.14);
   background:rgba(10,16,32,.65);
   color:var(--text);
-  min-width:170px;
+  min-width:0;
+  width:100%;
   outline:none;
 }
 input::placeholder{color:rgba(255,255,255,.45)}
@@ -1649,7 +1664,7 @@ button{
 }
 button:hover{filter:brightness(1.08)}
 
-.tabs{display:flex; gap:10px; flex-wrap:wrap; margin-top:12px}
+.tabs{display:flex; gap:10px; flex-wrap:nowrap; overflow-x:auto; margin-top:12px; padding-bottom:2px; -webkit-overflow-scrolling:touch}
 .tabbtn{
   padding:8px 12px;
   border-radius:999px;
@@ -1657,6 +1672,8 @@ button:hover{filter:brightness(1.08)}
   background:rgba(255,255,255,.06);
   cursor:pointer;
   font-size:13px;
+  white-space:nowrap;
+  flex:0 0 auto;
 }
 .tabbtn.active{background:rgba(155,209,255,.18); border-color:rgba(155,209,255,.35)}
 
@@ -1674,7 +1691,7 @@ button:hover{filter:brightness(1.08)}
 .grouphead{display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px}
 .grouphead h2{margin:0; font-size:20px}
 
-.grid{display:grid; grid-template-columns:repeat(auto-fit, minmax(340px, 1fr)); gap:12px}
+.grid{display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:12px}
 .card{border:1px solid rgba(255,255,255,.12); border-radius:16px; padding:12px 14px; background:rgba(13,19,36,.75)}
 .card:hover{border-color:rgba(255,255,255,.22)}
 .match{font-weight:750; font-size:14px; margin-bottom:6px}
@@ -1686,6 +1703,9 @@ button:hover{filter:brightness(1.08)}
 .badge{display:inline-flex; align-items:center; gap:6px; padding:2px 10px; border-radius:999px; font-size:12px; background:rgba(255, 193, 7, .14); border:1px solid rgba(255, 193, 7, .24);}
 .badge.ok{background:rgba(48, 209, 88, .12); border-color:rgba(48, 209, 88, .22);}
 .small{font-size:12px}
+.quickchips{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.chipbtn{padding:7px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.06);color:var(--text);font-size:12px;cursor:pointer}
+.chipbtn.active{background:rgba(155,209,255,.18);border-color:rgba(155,209,255,.35)}
 .table{width:100%; border-collapse:collapse; margin-top:10px; overflow:auto;}
 .table th,.table td{border-bottom:1px solid rgba(255,255,255,.10); padding:8px 10px; text-align:left; font-size:13px;}
 .table th{color:#c8d3e6; font-weight:700; position:sticky; top:0; background:rgba(10,16,32,.92)}
@@ -1725,6 +1745,29 @@ button:hover{filter:brightness(1.08)}
 .sg-cell{background:rgba(255,255,255,0.06)}
 .sg-axis{display:flex;justify-content:space-between;font-size:11px;opacity:.78;margin-top:6px}
 
+@media (max-width: 900px){
+  .sticky{position:static; backdrop-filter:none;}
+  .container{padding:16px 12px 56px;}
+  h1{font-size:24px;}
+  .group{padding:12px; border-radius:14px;}
+  .grouphead h2{font-size:18px;}
+  .detailgrid{grid-template-columns:1fr;}
+}
+
+@media (max-width: 640px){
+  .toolbar{padding:12px; border-radius:12px;}
+  .controls{grid-template-columns:1fr;}
+  .ctl{width:100%;}
+  .ctl.search-ctl{grid-column:auto;}
+  .tabs{gap:8px; margin-top:10px;}
+  .tabbtn{font-size:12px; padding:8px 10px;}
+  .grid{grid-template-columns:1fr;}
+  .card,.detailbox{padding:10px 11px; border-radius:13px;}
+  .match{font-size:13px; line-height:1.35;}
+  .table th,.table td{padding:7px 8px; font-size:12px;}
+  .table.wide{min-width:1320px}
+}
+
 """)
     parts.append("</style>")
 
@@ -1753,11 +1796,21 @@ button:hover{filter:brightness(1.08)}
 
     parts.append("<div class='ctl'><label>Min EV (%)</label><input id='minEv' type='number' step='0.1' value='5.0'></div>")
 
-    parts.append("<div class='ctl' style='flex:1; min-width:220px'><label>Search</label><input id='search' placeholder='Team / league / country...'></div>")
+    parts.append("<div class='ctl search-ctl'><label>Search</label><input id='search' placeholder='Team / league / country...'></div>")
 
     parts.append("<div class='ctl'><label>&nbsp;</label><button id='resetBtn'>Reset</button></div>")
 
     parts.append("</div>")  # controls
+    parts.append("<div class='quickchips'>")
+    parts.append("<button class='chipbtn' data-days='0'>Today</button>")
+    parts.append("<button class='chipbtn' data-days='1'>+1 day</button>")
+    parts.append("<button class='chipbtn' data-days='3'>+3 days</button>")
+    parts.append("<button class='chipbtn' data-days='7'>+7 days</button>")
+    parts.append("<button class='chipbtn' data-ev='3'>EV 3%+</button>")
+    parts.append("<button class='chipbtn active' data-ev='5'>EV 5%+</button>")
+    parts.append("<button class='chipbtn' data-ev='8'>EV 8%+</button>")
+    parts.append("</div>")
+    parts.append("<div class='muted small' style='margin-top:8px'>Tip: on mobile, swipe tab buttons and wide tables horizontally.</div>")
 
     # Tabs
     parts.append("<div class='tabs'>")
@@ -1794,6 +1847,7 @@ button:hover{filter:brightness(1.08)}
             parts.append("</div>")
             parts.append(f"<div class='muted small' style='margin-top:8px'>Fair 1X2: H {float(b.get('fair_odds_h',0) or 0):.2f} · D {float(b.get('fair_odds_d',0) or 0):.2f} · A {float(b.get('fair_odds_a',0) or 0):.2f}</div>")
             parts.append(f"<div class='muted small' style='margin-top:4px'>Bookie 1X2: H {float(b.get('mkt_odds_h',0) or 0):.2f} · D {float(b.get('mkt_odds_d',0) or 0):.2f} · A {float(b.get('mkt_odds_a',0) or 0):.2f}</div>")
+            parts.append(_format_edge_line(b))
             parts.append(f"<div class='muted small' style='margin-top:6px'>xG: {_html_escape(b.get('home',''))} <b>{float(b.get('h_xg',0) or 0):.2f}</b> v <b>{float(b.get('a_xg',0) or 0):.2f}</b> {_html_escape(b.get('away',''))}</div>")
             books = b.get('top_books', []) or []
             if books:
@@ -1828,6 +1882,7 @@ button:hover{filter:brightness(1.08)}
                 parts.append("</div>")
                 parts.append(f"<div class='muted small' style='margin-top:8px'>Fair 1X2: H {float(b.get('fair_odds_h',0) or 0):.2f} · D {float(b.get('fair_odds_d',0) or 0):.2f} · A {float(b.get('fair_odds_a',0) or 0):.2f}</div>")
                 parts.append(f"<div class='muted small' style='margin-top:4px'>Bookie 1X2: H {float(b.get('mkt_odds_h',0) or 0):.2f} · D {float(b.get('mkt_odds_d',0) or 0):.2f} · A {float(b.get('mkt_odds_a',0) or 0):.2f}</div>")
+                parts.append(_format_edge_line(b))
                 parts.append(f"<div class='muted small' style='margin-top:6px'>xG: {_html_escape(b.get('home',''))} <b>{float(b.get('h_xg',0) or 0):.2f}</b> v <b>{float(b.get('a_xg',0) or 0):.2f}</b> {_html_escape(b.get('away',''))}</div>")
                 books = b.get('top_books', []) or []
                 if books:
@@ -1862,6 +1917,7 @@ button:hover{filter:brightness(1.08)}
         parts.append("</div>")
         parts.append(f"<div class='muted small' style='margin-top:8px'>Fair 1X2: H {float(b.get('fair_odds_h',0) or 0):.2f} · D {float(b.get('fair_odds_d',0) or 0):.2f} · A {float(b.get('fair_odds_a',0) or 0):.2f}</div>")
         parts.append(f"<div class='muted small' style='margin-top:4px'>Bookie 1X2: H {float(b.get('mkt_odds_h',0) or 0):.2f} · D {float(b.get('mkt_odds_d',0) or 0):.2f} · A {float(b.get('mkt_odds_a',0) or 0):.2f}</div>")
+        parts.append(_format_edge_line(b))
         parts.append(f"<div class='muted small' style='margin-top:6px'>xG: {_html_escape(b.get('home',''))} <b>{float(b.get('h_xg',0) or 0):.2f}</b> v <b>{float(b.get('a_xg',0) or 0):.2f}</b> {_html_escape(b.get('away',''))}</div>")
         books = b.get('top_books', []) or []
         if books:
@@ -2224,6 +2280,7 @@ const leagueSel = document.getElementById('leagueSel');
 const minEv = document.getElementById('minEv');
 const search = document.getElementById('search');
 const shownCount = document.getElementById('shownCount');
+const chipButtons = Array.from(document.querySelectorAll('.chipbtn'));
 
 let activeTab = 'grouped';
 
@@ -2231,6 +2288,35 @@ let activeTab = 'grouped';
 const t = todayISO();
 if(fromDate && !fromDate.value) fromDate.value = t;
 if(toDate && !toDate.value) toDate.value = t;
+
+
+function addDaysISO(iso, n){
+  const d = parseDate(iso) || new Date();
+  d.setDate(d.getDate()+n);
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth()+1).padStart(2,'0');
+  const dd = String(d.getDate()).padStart(2,'0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+for(const chip of chipButtons){
+  chip.addEventListener('click', ()=>{
+    if(chip.dataset.days !== undefined){
+      const base = todayISO();
+      const days = parseInt(chip.dataset.days || '0', 10) || 0;
+      if(fromDate) fromDate.value = base;
+      if(toDate) toDate.value = addDaysISO(base, days);
+      for(const c of chipButtons.filter(x=>x.dataset.days!==undefined)){ c.classList.remove('active'); }
+      chip.classList.add('active');
+    }
+    if(chip.dataset.ev !== undefined){
+      if(minEv) minEv.value = chip.dataset.ev;
+      for(const c of chipButtons.filter(x=>x.dataset.ev!==undefined)){ c.classList.remove('active'); }
+      chip.classList.add('active');
+    }
+    applyFilters();
+  });
+}
 
 function parseDate(s){
   if(!s) return null;
@@ -2553,6 +2639,9 @@ for league, fixtures in fixtures_data.items():
                         'mkt_odds_d': median_market_price(all_books, 'D', fallback=float(fallback_mkt['D'] or 0)),
                         'mkt_odds_a': median_market_price(all_books, 'A', fallback=float(fallback_mkt['A'] or 0)),
                         'top_books': top_books,
+                        'model_prob': float((pred.get('probs', {}) or {}).get(v['out'], 0) or 0),
+                        'market_prob': (1.0 / float(v.get('mkt_o', 0) or 0)) if float(v.get('mkt_o', 0) or 0) > 0 else 0.0,
+                        'edge_pp': (float((pred.get('probs', {}) or {}).get(v['out'], 0) or 0) - ((1.0 / float(v.get('mkt_o', 0) or 0)) if float(v.get('mkt_o', 0) or 0) > 0 else 0.0)) * 100.0,
                     })
         except Exception:
             pass
