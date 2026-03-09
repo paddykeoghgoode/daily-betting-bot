@@ -34,6 +34,8 @@ import os
 import argparse
 from datetime import datetime
 import pickle
+import re
+import urllib.parse
 
 import pandas as pd
 import numpy as np
@@ -1282,6 +1284,147 @@ class Backtester:
 # FIXTURES ODDS HELPERS (multi-bookie)
 # =============================================================================
 
+
+
+def extract_market_totals_odds(row):
+    """Extract O/U market odds from football-data columns.
+
+    Supported patterns include:
+      - BOOK>2.5 / BOOK<2.5 (e.g. B365>2.5)
+      - BOOKO2.5 / BOOKU2.5 (common alternate naming)
+      - O2.5 / U2.5
+
+    Returns dict: {"2.50_over": median_over, "2.50_under": median_under, ...}
+    """
+    by_line = {}
+    try:
+        keys = [k for k in list(row.index) if isinstance(k, str)]
+        rx_angle = re.compile(r"^[A-Za-z0-9_]*([<>])(\d+(?:\.\d+)?)$")
+        rx_ou = re.compile(r"^[A-Za-z0-9_]*([OU])(\d+(?:\.\d+)?)$", re.IGNORECASE)
+
+        for k in keys:
+            col = k.strip().replace(' ', '')
+            side = None
+            line = None
+
+            m1 = rx_angle.match(col)
+            if m1:
+                side = 'over' if m1.group(1) == '>' else 'under'
+                line = float(m1.group(2))
+            else:
+                m2 = rx_ou.match(col)
+                if m2:
+                    side = 'over' if m2.group(1).upper() == 'O' else 'under'
+                    line = float(m2.group(2))
+
+            if side is None or line is None:
+                continue
+
+            try:
+                odd = float(row.get(k, 0) or 0)
+            except Exception:
+                odd = 0
+            if not (1.01 < odd < 100):
+                continue
+
+            key = f"{line:.2f}_{side}"
+            by_line.setdefault(key, []).append(odd)
+    except Exception:
+        return {}
+
+    out = {}
+    for k, vals in by_line.items():
+        if vals:
+            out[k] = float(np.median(vals))
+    return out
+
+
+def extract_market_btts_odds(row):
+    """Extract BTTS odds from columns like B365BTTS/BTTS and yes/no variants."""
+    yes_vals, no_vals = [], []
+    keys = [k for k in list(row.index) if isinstance(k, str)]
+
+    # direct yes/no columns used by some feeds
+    for k in keys:
+        ku = k.strip().upper()
+        try:
+            v = float(row.get(k, 0) or 0)
+        except Exception:
+            v = 0
+        if not (1.01 < v < 100):
+            continue
+        if 'BTTS' in ku and ('YES' in ku or ku.endswith('Y')):
+            yes_vals.append(v)
+        elif 'BTTS' in ku and ('NO' in ku or ku.endswith('N')):
+            no_vals.append(v)
+
+    # paired form: <BOOK>BTTS + <BOOK>BTTSN
+    for k in keys:
+        if not isinstance(k, str):
+            continue
+        ku = k.strip().upper()
+        if ku.endswith('BTTS'):
+            pref = k[:-4]
+            ncol = pref + 'BTTSN'
+            if ncol in row.index:
+                try:
+                    yv = float(row.get(k, 0) or 0)
+                    nv = float(row.get(ncol, 0) or 0)
+                    if 1.01 < yv < 100:
+                        yes_vals.append(yv)
+                    if 1.01 < nv < 100:
+                        no_vals.append(nv)
+                except Exception:
+                    pass
+
+    out = {}
+    if yes_vals:
+        out['yes'] = float(np.median(yes_vals))
+    if no_vals:
+        out['no'] = float(np.median(no_vals))
+    return out
+
+
+def extract_market_ah_odds(row):
+    """Extract AH prices using AH line columns where available.
+
+    Common football-data fields:
+      - AHh (line), B365AHH (home), B365AHA (away)
+      - AHCh (line), B365CAHH (home), B365CAHA (away)
+    Returns dict like {"-0.50_home": 1.95, "-0.50_away": 1.92}
+    """
+    out = {}
+    keys = [k for k in list(row.index) if isinstance(k, str)]
+
+    def _collect(line_col, home_suffix, away_suffix):
+        if line_col not in row.index:
+            return
+        try:
+            line = float(row.get(line_col, 0) or 0)
+        except Exception:
+            return
+        hvals, avals = [], []
+        for k in keys:
+            ku = k.strip().upper()
+            try:
+                v = float(row.get(k, 0) or 0)
+            except Exception:
+                v = 0
+            if not (1.01 < v < 100):
+                continue
+            if ku.endswith(home_suffix):
+                hvals.append(v)
+            elif ku.endswith(away_suffix):
+                avals.append(v)
+        if hvals:
+            out[f"{line:+.2f}_home"] = float(np.median(hvals))
+        if avals:
+            out[f"{line:+.2f}_away"] = float(np.median(avals))
+
+    _collect('AHh', 'AHH', 'AHA')
+    _collect('AHCh', 'CAHH', 'CAHA')
+    return out
+
 def extract_all_book_odds(row):
     """
     From a fixtures row, extract all bookie odds that look like <BOOK>H/<BOOK>D/<BOOK>A.
@@ -1378,6 +1521,49 @@ def _html_escape(s):
 
 
 
+def _wikidata_logo_filename(entity_id):
+    try:
+        url = "https://www.wikidata.org/w/api.php"
+        params = {'action': 'wbgetclaims', 'entity': entity_id, 'property': 'P154', 'format': 'json'}
+        r = requests.get(url, params=params, timeout=6)
+        r.raise_for_status()
+        data = r.json() or {}
+        claims = ((data.get('claims') or {}).get('P154') or [])
+        if not claims:
+            return None
+        val = (((claims[0].get('mainsnak') or {}).get('datavalue') or {}).get('value') or '')
+        return str(val).strip() if val else None
+    except Exception:
+        return None
+
+
+def _lookup_team_logo_svg(team_name, cache):
+    t = str(team_name or '').strip()
+    if not t:
+        return ''
+    if t in cache:
+        return cache[t] or ''
+    try:
+        url = "https://www.wikidata.org/w/api.php"
+        params = {'action': 'wbsearchentities', 'search': t, 'language': 'en', 'format': 'json', 'limit': 6}
+        r = requests.get(url, params=params, timeout=6)
+        r.raise_for_status()
+        data = r.json() or {}
+        for item in (data.get('search') or []):
+            ent = item.get('id')
+            if not ent:
+                continue
+            logo_file = _wikidata_logo_filename(ent)
+            if logo_file:
+                url = "https://commons.wikimedia.org/wiki/Special:FilePath/" + urllib.parse.quote(logo_file)
+                cache[t] = url
+                return url
+    except Exception:
+        pass
+    cache[t] = ''
+    return ''
+
+
 def write_html_report(all_value_bets, all_fixtures=None, out_path="output/value_bets.html"):
     """Write a standalone HTML report with tabs + filtering UI.
 
@@ -1389,6 +1575,15 @@ def write_html_report(all_value_bets, all_fixtures=None, out_path="output/value_
     Filters apply to the currently selected tab.
     """
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    logo_cache_path = os.path.join(os.path.dirname(out_path), "team_logo_cache.pkl")
+    try:
+        with open(logo_cache_path, 'rb') as f:
+            logo_cache = pickle.load(f)
+            if not isinstance(logo_cache, dict):
+                logo_cache = {}
+    except Exception:
+        logo_cache = {}
 
     def _time_to_minutes(t):
         try:
@@ -1475,6 +1670,30 @@ def write_html_report(all_value_bets, all_fixtures=None, out_path="output/value_
             label = 'Low'
             cls = 'low'
         return label, cls, score
+
+    def _teamline_html(home, away):
+        h = str(home or '')
+        a = str(away or '')
+        hl = team_logo_urls.get(h, '')
+        al = team_logo_urls.get(a, '')
+        hs = (h[:1] or '?').upper()
+        as_ = (a[:1] or '?').upper()
+        h_logo = f"<img class='teamlogo' src='{_html_escape(hl)}' loading='lazy' onerror='this.style.display=&quot;none&quot;;this.nextElementSibling.style.display=&quot;inline-flex&quot;'><span class='teamfallback'>{_html_escape(hs)}</span>" if hl else f"<span class='teamfallback'>{_html_escape(hs)}</span>"
+        a_logo = f"<img class='teamlogo' src='{_html_escape(al)}' loading='lazy' onerror='this.style.display=&quot;none&quot;;this.nextElementSibling.style.display=&quot;inline-flex&quot;'><span class='teamfallback'>{_html_escape(as_)}</span>" if al else f"<span class='teamfallback'>{_html_escape(as_)}</span>"
+        return f"<div class='teamline'><span class='logo'>{h_logo}</span><span>{_html_escape(h)}</span><span class='muted'>vs</span><span class='logo'>{a_logo}</span><span>{_html_escape(a)}</span></div>"
+
+    def _format_edge_line(b):
+        model_prob = float(b.get('model_prob', 0) or 0)
+        market_prob = float(b.get('market_prob', 0) or 0)
+        edge_pp = float(b.get('edge_pp', 0) or 0)
+        if model_prob <= 0 and market_prob <= 0:
+            return ""
+        edge_cls = 'edge-pos' if edge_pp >= 0 else 'edge-neg'
+        return (
+            f"<div class='muted small' style='margin-top:4px'>"
+            f"Model P: <b>{model_prob*100:.1f}%</b> · Market Implied: <b>{market_prob*100:.1f}%</b> · "
+            f"Edge: <b class='{edge_cls}'>{edge_pp:+.1f}pp</b></div>"
+        )
 
     def _render_recent_form_table(fix):
         recent = fix.get('recent_form', {}) or {}
@@ -1564,6 +1783,79 @@ def write_html_report(all_value_bets, all_fixtures=None, out_path="output/value_
         )
     )
 
+
+    all_teams = set()
+    for b in bets_time_sorted:
+        all_teams.add(str(b.get('home', '')).strip())
+        all_teams.add(str(b.get('away', '')).strip())
+    for f in fixtures_sorted:
+        all_teams.add(str(f.get('home', '')).strip())
+        all_teams.add(str(f.get('away', '')).strip())
+    all_teams = sorted([t for t in all_teams if t])
+    team_logo_urls = {t: _lookup_team_logo_svg(t, logo_cache) for t in all_teams}
+
+    ou_opps = []
+    fixtures_with_totals_market = 0
+    for f in fixtures_sorted:
+        try:
+            mkt_tot = f.get('mkt_totals') or {}
+            lines = sorted({
+                float(str(k).split('_')[0])
+                for k in mkt_tot.keys()
+                if isinstance(k, str) and '_over' in k
+            })
+            if not lines:
+                continue
+            fixtures_with_totals_market += 1
+
+            hxg = float(f.get('h_xg', 0) or 0)
+            axg = float(f.get('a_xg', 0) or 0)
+            mat = poisson_matrix_dc(hxg, axg, rho=0.0, max_g=11)
+            totp = total_probs_from_matrix(mat)
+
+            best = None
+            for line in lines:
+                mk_over = float(mkt_tot.get(f"{line:.2f}_over") or mkt_tot.get(f"{line}_over") or 0)
+                mk_under = float(mkt_tot.get(f"{line:.2f}_under") or mkt_tot.get(f"{line}_under") or 0)
+                if mk_over <= 1.01 and mk_under <= 1.01:
+                    continue
+
+                fair_over, fair_under = fair_totals_ou(totp, line)
+                over_ev = (mk_over / fair_over) - 1.0 if (mk_over > 1.01 and fair_over > 1.01) else -1.0
+                under_ev = (mk_under / fair_under) - 1.0 if (mk_under > 1.01 and fair_under > 1.01) else -1.0
+                side = 'Over' if over_ev >= under_ev else 'Under'
+                edge = max(over_ev, under_ev)
+
+                if (best is None) or (edge > best['edge']):
+                    best = {
+                        'line': line,
+                        'mk_over': mk_over, 'mk_under': mk_under,
+                        'fair_over': fair_over, 'fair_under': fair_under,
+                        'over_ev': over_ev, 'under_ev': under_ev,
+                        'best_side': side,
+                        'edge': edge,
+                    }
+
+            if not best or best['edge'] < 0.03:
+                continue
+
+            side_line = f"{best['best_side']} {best['line']:.2f}"
+            pick_odds = best['mk_over'] if best['best_side'] == 'Over' else best['mk_under']
+            tip = f"Lean {side_line} if odds stay ≥ {max(pick_odds, 1.01):.2f}"
+            ou_opps.append({
+                'date': f.get('date', ''), 'kickoff': f.get('kickoff', ''), 'country': f.get('country', ''),
+                'league_name': f.get('league_name', ''), 'home': f.get('home', ''), 'away': f.get('away', ''),
+                'h_xg': hxg, 'a_xg': axg,
+                'line': best['line'],
+                'fair_over': best['fair_over'], 'fair_under': best['fair_under'],
+                'mk_over': best['mk_over'], 'mk_under': best['mk_under'],
+                'over_ev': best['over_ev']*100.0, 'under_ev': best['under_ev']*100.0,
+                'best_side': side_line, 'edge': best['edge']*100.0, 'tip': tip,
+            })
+        except Exception:
+            pass
+    ou_opps = sorted(ou_opps, key=lambda x: -float(x.get('edge', 0) or 0))
+
     # Filter controls lists (union from bets + fixtures)
     countries = sorted({*(b.get('country', 'Unknown') for b in bets_time_sorted), *(f.get('country', 'Unknown') for f in fixtures_sorted)})
     leagues = sorted({*(b.get('league_name', b.get('league', '')) for b in bets_time_sorted), *(f.get('league_name', f.get('league', '')) for f in fixtures_sorted)})
@@ -1597,20 +1889,20 @@ def write_html_report(all_value_bets, all_fixtures=None, out_path="output/value_
     parts.append("/* All Fixtures: highlight biggest market-vs-fair differences */\ntd.bestedge{box-shadow: inset 0 0 0 2px rgba(255,255,255,.28); }\n")
     parts.append(r"""
 :root{
-  --bg:#070a12;
-  --panel:#0d1324;
-  --panel2:#0a1020;
-  --text:#e9efff;
-  --muted:#aab7cf;
-  --line:rgba(255,255,255,.10);
-  --pill:rgba(255,255,255,.08);
-  --shadow: 0 10px 28px rgba(0,0,0,.38);
+  --bg:#f6f7fb;
+  --panel:#ffffff;
+  --panel2:#f9fafc;
+  --text:#1f2937;
+  --muted:#6b7280;
+  --line:rgba(15,23,42,.12);
+  --pill:rgba(15,23,42,.06);
+  --shadow: 0 8px 24px rgba(15,23,42,.08);
 }
 *{box-sizing:border-box;}
 body{
   font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;
   margin:0;
-  background:radial-gradient(1200px 800px at 20% 0%, #152a66 0%, var(--bg) 55%) fixed;
+  background:var(--bg);
   color:var(--text);
 }
 .container{max-width:1250px; margin:0 auto; padding:22px 16px 70px;}
@@ -1623,42 +1915,46 @@ h1{margin:0 0 10px 0; font-size:28px; letter-spacing:0.2px}
   padding:14px;
   border:1px solid var(--line);
   border-radius:14px;
-  background:linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.03));
+  background:#ffffff;
   box-shadow:var(--shadow);
 }
-.controls{display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end;}
+.controls{display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:12px; align-items:flex-end;}
 .ctl{display:flex; flex-direction:column; gap:6px}
-label{font-size:12px; color:#c4cfe5}
+.ctl.search-ctl{grid-column:span 2}
+label{font-size:12px; color:#4b5563}
 input,select{
   padding:10px 10px;
   border-radius:12px;
-  border:1px solid rgba(255,255,255,.14);
-  background:rgba(10,16,32,.65);
+  border:1px solid rgba(15,23,42,.18);
+  background:#ffffff;
   color:var(--text);
-  min-width:170px;
+  min-width:0;
+  width:100%;
   outline:none;
 }
-input::placeholder{color:rgba(255,255,255,.45)}
+input::placeholder{color:#94a3b8}
 button{
   padding:10px 14px;
   border-radius:12px;
-  border:1px solid rgba(255,255,255,.16);
-  background:rgba(255,255,255,.08);
+  border:1px solid rgba(15,23,42,.16);
+  background:#ffffff;
   color:var(--text);
   cursor:pointer;
 }
-button:hover{filter:brightness(1.08)}
+button:hover{background:#f8fafc}
 
-.tabs{display:flex; gap:10px; flex-wrap:wrap; margin-top:12px}
+.tabs{display:flex; gap:10px; flex-wrap:nowrap; overflow-x:auto; margin-top:12px; padding-bottom:2px; -webkit-overflow-scrolling:touch; scrollbar-width:thin}
 .tabbtn{
   padding:8px 12px;
   border-radius:999px;
-  border:1px solid rgba(255,255,255,.16);
+  border:1px solid rgba(15,23,42,.16);
   background:rgba(255,255,255,.06);
   cursor:pointer;
   font-size:13px;
+  white-space:nowrap;
+  flex:0 0 auto;
 }
-.tabbtn.active{background:rgba(155,209,255,.18); border-color:rgba(155,209,255,.35)}
+.tabbtn.active{background:#e8f0ff; border-color:#b7cdfa; color:#1d4ed8; font-weight:700}
 
 .section{margin-top:16px;}
 .hidden{display:none !important;}
@@ -1666,7 +1962,7 @@ button:hover{filter:brightness(1.08)}
 .group{
   border:1px solid var(--line);
   border-radius:18px;
-  background:rgba(255,255,255,.03);
+  background:#ffffff;
   box-shadow:var(--shadow);
   padding:14px;
   margin:16px 0;
@@ -1674,28 +1970,38 @@ button:hover{filter:brightness(1.08)}
 .grouphead{display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px}
 .grouphead h2{margin:0; font-size:20px}
 
-.grid{display:grid; grid-template-columns:repeat(auto-fit, minmax(340px, 1fr)); gap:12px}
-.card{border:1px solid rgba(255,255,255,.12); border-radius:16px; padding:12px 14px; background:rgba(13,19,36,.75)}
-.card:hover{border-color:rgba(255,255,255,.22)}
+.grid{display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:12px}
+.card{border:1px solid rgba(15,23,42,.12); border-radius:16px; padding:12px 14px; background:#ffffff}
+.card:hover{border-color:rgba(15,23,42,.24)}
 .match{font-weight:750; font-size:14px; margin-bottom:6px}
+.teamline{display:flex;align-items:center;gap:7px;margin-top:4px;font-size:12px;color:var(--muted)}
+.teamlogo{width:18px;height:18px;object-fit:contain;border-radius:50%;background:rgba(255,255,255,.9);padding:1px}
+.teamfallback{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;font-size:10px;background:#e5e7eb;color:#374151}
+.logo{display:inline-flex;align-items:center}
 .row{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
-.pill{display:inline-flex; align-items:center; gap:6px; padding:3px 10px; border:1px solid rgba(255,255,255,.14); border-radius:999px; font-size:12px; background:rgba(255,255,255,.06)}
+.pill{display:inline-flex; align-items:center; gap:6px; padding:3px 10px; border:1px solid rgba(15,23,42,.14); border-radius:999px; font-size:12px; background:#f3f4f6}
 .kv{font-size:13px}
 .kv b{font-weight:800}
 .books{font-size:12px; color:var(--muted); margin-top:8px}
 .badge{display:inline-flex; align-items:center; gap:6px; padding:2px 10px; border-radius:999px; font-size:12px; background:rgba(255, 193, 7, .14); border:1px solid rgba(255, 193, 7, .24);}
 .badge.ok{background:rgba(48, 209, 88, .12); border-color:rgba(48, 209, 88, .22);}
 .small{font-size:12px}
+.quickchips{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.summarybar{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.statpill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12px;border:1px solid rgba(15,23,42,.14);background:#f8fafc;color:#334155}
+.statpill b{font-size:12px}
+.chipbtn{padding:7px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.06);color:var(--text);font-size:12px;cursor:pointer}
+.chipbtn.active{background:#e8f0ff;border-color:#b7cdfa}
 .table{width:100%; border-collapse:collapse; margin-top:10px; overflow:auto;}
 .table th,.table td{border-bottom:1px solid rgba(255,255,255,.10); padding:8px 10px; text-align:left; font-size:13px;}
-.table th{color:#c8d3e6; font-weight:700; position:sticky; top:0; background:rgba(10,16,32,.92)}
+.table th{color:#334155; font-weight:700; position:sticky; top:0; background:#f8fafc}
 .tablewrap{width:100%; overflow-x:auto}
 .table.wide{min-width:1780px}
 .stats-table th,.stats-table td{font-size:12px}
 .stats-table td.team{font-weight:700}
 .stats-table td.scope{color:var(--muted)}
 .stats-table{border:1px solid rgba(255,255,255,.18);border-radius:12px;overflow:hidden}
-.stats-table thead th{background:rgba(255,255,255,.06)}
+.stats-table thead th{background:#f8fafc}
 .stats-table tbody tr{border-bottom:1px solid rgba(255,255,255,.12)}
 .stats-table tbody tr:last-child{border-bottom:none}
 .stats-table td,.stats-table th{border-right:1px solid rgba(255,255,255,.10)}
@@ -1712,18 +2018,41 @@ button:hover{filter:brightness(1.08)}
 
 .fixrow{cursor:pointer}
 .detailrow td{padding:0;border-bottom:none}
-.detailwrap{padding:12px 12px 14px 12px;border:1px solid rgba(255,255,255,.10);border-radius:16px;background:rgba(13,19,36,.55);margin:10px 0}
+.detailwrap{padding:12px 12px 14px 12px;border:1px solid rgba(15,23,42,.10);border-radius:16px;background:#ffffff;margin:10px 0}
 .detailgrid{display:grid;grid-template-columns:repeat(auto-fit, minmax(320px, 1fr));gap:12px;margin-top:10px}
-.detailbox{border:1px solid rgba(255,255,255,.12);border-radius:16px;padding:12px 14px;background:rgba(13,19,36,.70)}
+.detailbox{border:1px solid rgba(15,23,42,.12);border-radius:16px;padding:12px 14px;background:#ffffff}
 .detailbox h4{margin:0 0 6px 0;font-size:14px}
 .sg-wrap{margin-top:10px}
 .sg-title{font-weight:700;margin:6px 0 8px}
 .sg-table{width:100%;border-collapse:separate;border-spacing:6px}
 .sg-table th,.sg-table td{padding:8px 10px;text-align:center;border-radius:10px;font-size:12px;border:1px solid rgba(255,255,255,0.08)}
-.sg-corner{background:rgba(255,255,255,0.03)}
-.sg-row,.sg-col{font-weight:700;background:rgba(255,255,255,0.04)}
-.sg-cell{background:rgba(255,255,255,0.06)}
+.sg-corner{background:#f8fafc}
+.sg-row,.sg-col{font-weight:700;background:#f3f4f6}
+.sg-cell{background:#eef2f7}
 .sg-axis{display:flex;justify-content:space-between;font-size:11px;opacity:.78;margin-top:6px}
+
+@media (max-width: 900px){
+  .sticky{position:static; backdrop-filter:none;}
+  .container{padding:16px 12px 56px;}
+  h1{font-size:24px;}
+  .group{padding:12px; border-radius:14px;}
+  .grouphead h2{font-size:18px;}
+  .detailgrid{grid-template-columns:1fr;}
+}
+
+@media (max-width: 640px){
+  .toolbar{padding:12px; border-radius:12px;}
+  .controls{grid-template-columns:1fr;}
+  .ctl{width:100%;}
+  .ctl.search-ctl{grid-column:auto;}
+  .tabs{gap:8px; margin-top:10px;}
+  .tabbtn{font-size:12px; padding:8px 10px;}
+  .grid{grid-template-columns:1fr;}
+  .card,.detailbox{padding:10px 11px; border-radius:13px;}
+  .match{font-size:13px; line-height:1.35;}
+  .table th,.table td{padding:7px 8px; font-size:12px;}
+  .table.wide{min-width:1320px}
+}
 
 """)
     parts.append("</style>")
@@ -1740,6 +2069,7 @@ button:hover{filter:brightness(1.08)}
 
     parts.append("<div class='ctl'><label>From date</label><input id='fromDate' type='date'></div>")
     parts.append("<div class='ctl'><label>To date</label><input id='toDate' type='date'></div>")
+    parts.append("<div class='ctl'><label>Range preset</label><select id='datePreset'><option value='0' selected>Today only</option><option value='2'>Next 2 days</option><option value='3'>Next 3 days</option><option value='7'>Next 7 days</option><option value='custom'>Custom</option></select></div>")
 
     parts.append("<div class='ctl'><label>Country</label><select id='countrySel'><option value=''>All</option>")
     for c in countries:
@@ -1753,17 +2083,35 @@ button:hover{filter:brightness(1.08)}
 
     parts.append("<div class='ctl'><label>Min EV (%)</label><input id='minEv' type='number' step='0.1' value='5.0'></div>")
 
-    parts.append("<div class='ctl' style='flex:1; min-width:220px'><label>Search</label><input id='search' placeholder='Team / league / country...'></div>")
+    parts.append("<div class='ctl search-ctl'><label>Search</label><input id='search' placeholder='Team / league / country...'></div>")
 
     parts.append("<div class='ctl'><label>&nbsp;</label><button id='resetBtn'>Reset</button></div>")
 
     parts.append("</div>")  # controls
+    parts.append("<div class='quickchips'>")
+    parts.append("<button class='chipbtn' data-days='0'>Today</button>")
+    parts.append("<button class='chipbtn' data-days='1'>+1 day</button>")
+    parts.append("<button class='chipbtn' data-days='3'>+3 days</button>")
+    parts.append("<button class='chipbtn' data-days='7'>+7 days</button>")
+    parts.append("<button class='chipbtn' data-ev='3'>EV 3%+</button>")
+    parts.append("<button class='chipbtn active' data-ev='5'>EV 5%+</button>")
+    parts.append("<button class='chipbtn' data-ev='8'>EV 8%+</button>")
+    parts.append("</div>")
+    parts.append("<div class='muted small' style='margin-top:8px'>Tip: on mobile, swipe tab buttons and wide tables horizontally.</div>")
 
     # Tabs
     parts.append("<div class='tabs'>")
     parts.append("<button class='tabbtn active' data-tab='grouped'>Value Bets (Grouped)</button>")
     parts.append("<button class='tabbtn' data-tab='time'>Bets by Time</button>")
     parts.append("<button class='tabbtn' data-tab='fixtures'>All Fixtures (xG)</button>")
+    parts.append("<button class='tabbtn' data-tab='totals'>O/U edges</button>")
+    parts.append("</div>")
+
+    parts.append("<div class='summarybar'>")
+    parts.append("<span class='statpill'>Grouped: <b id='countGrouped'>0</b></span>")
+    parts.append("<span class='statpill'>By time: <b id='countTime'>0</b></span>")
+    parts.append("<span class='statpill'>O/U: <b id='countTotals'>0</b></span>")
+    parts.append("<span class='statpill'>Fixtures: <b id='countFixtures'>0</b></span>")
     parts.append("</div>")
 
     parts.append("</div>")  # toolbar
@@ -1783,7 +2131,8 @@ button:hover{filter:brightness(1.08)}
             parts.append(
                 f"<div class='card betcard' data-kind='grouped' data-best='1' data-date='{_html_escape(b.get('date',''))}' data-country='{_html_escape(b.get('country',''))}' data-league='{_html_escape(b.get('league_name',''))}' data-ev='{float(b.get('ev',0) or 0):.3f}' data-search='{_html_escape((str(b.get('home',''))+' '+str(b.get('away',''))+' '+str(b.get('league_name',''))+' '+str(b.get('country',''))).lower())}'>"
             )
-            parts.append(f"<div class='match'>{_html_escape(b.get('date',''))}{ko_txt} — {_html_escape(b.get('home',''))} vs {_html_escape(b.get('away',''))}</div>")
+            parts.append(f"<div class='match'>{_html_escape(b.get('date',''))}{ko_txt}</div>")
+            parts.append(_teamline_html(b.get('home',''), b.get('away','')))
             parts.append("<div class='row'>")
             parts.append(f"<span class='pill'>{_html_escape(b.get('bet_label',''))}</span>")
             parts.append(f"<span class='kv'>Market(median): <b>{float(b.get('mkt_median', b.get('odds',0)) or 0):.2f}</b></span>")
@@ -1794,6 +2143,7 @@ button:hover{filter:brightness(1.08)}
             parts.append("</div>")
             parts.append(f"<div class='muted small' style='margin-top:8px'>Fair 1X2: H {float(b.get('fair_odds_h',0) or 0):.2f} · D {float(b.get('fair_odds_d',0) or 0):.2f} · A {float(b.get('fair_odds_a',0) or 0):.2f}</div>")
             parts.append(f"<div class='muted small' style='margin-top:4px'>Bookie 1X2: H {float(b.get('mkt_odds_h',0) or 0):.2f} · D {float(b.get('mkt_odds_d',0) or 0):.2f} · A {float(b.get('mkt_odds_a',0) or 0):.2f}</div>")
+            parts.append(_format_edge_line(b))
             parts.append(f"<div class='muted small' style='margin-top:6px'>xG: {_html_escape(b.get('home',''))} <b>{float(b.get('h_xg',0) or 0):.2f}</b> v <b>{float(b.get('a_xg',0) or 0):.2f}</b> {_html_escape(b.get('away',''))}</div>")
             books = b.get('top_books', []) or []
             if books:
@@ -1817,7 +2167,8 @@ button:hover{filter:brightness(1.08)}
                 parts.append(
                     f"<div class='card betcard' data-kind='grouped' data-best='0' data-date='{_html_escape(b.get('date',''))}' data-country='{_html_escape(country)}' data-league='{_html_escape(league_name)}' data-ev='{float(b.get('ev',0) or 0):.3f}' data-search='{_html_escape((str(b.get('home',''))+' '+str(b.get('away',''))+' '+str(league_name)+' '+str(country)).lower())}'>"
                 )
-                parts.append(f"<div class='match'>{_html_escape(b.get('date',''))}{ko_txt} — {_html_escape(b.get('home',''))} vs {_html_escape(b.get('away',''))}</div>")
+                parts.append(f"<div class='match'>{_html_escape(b.get('date',''))}{ko_txt}</div>")
+                parts.append(_teamline_html(b.get('home',''), b.get('away','')))
                 parts.append("<div class='row'>")
                 parts.append(f"<span class='pill'>{_html_escape(b.get('bet_label',''))}</span>")
                 parts.append(f"<span class='kv'>Market(median): <b>{float(b.get('mkt_median', b.get('odds',0)) or 0):.2f}</b></span>")
@@ -1828,6 +2179,7 @@ button:hover{filter:brightness(1.08)}
                 parts.append("</div>")
                 parts.append(f"<div class='muted small' style='margin-top:8px'>Fair 1X2: H {float(b.get('fair_odds_h',0) or 0):.2f} · D {float(b.get('fair_odds_d',0) or 0):.2f} · A {float(b.get('fair_odds_a',0) or 0):.2f}</div>")
                 parts.append(f"<div class='muted small' style='margin-top:4px'>Bookie 1X2: H {float(b.get('mkt_odds_h',0) or 0):.2f} · D {float(b.get('mkt_odds_d',0) or 0):.2f} · A {float(b.get('mkt_odds_a',0) or 0):.2f}</div>")
+                parts.append(_format_edge_line(b))
                 parts.append(f"<div class='muted small' style='margin-top:6px'>xG: {_html_escape(b.get('home',''))} <b>{float(b.get('h_xg',0) or 0):.2f}</b> v <b>{float(b.get('a_xg',0) or 0):.2f}</b> {_html_escape(b.get('away',''))}</div>")
                 books = b.get('top_books', []) or []
                 if books:
@@ -1850,7 +2202,8 @@ button:hover{filter:brightness(1.08)}
         parts.append(
             f"<div class='card betcard' data-kind='time' data-best='0' data-date='{_html_escape(b.get('date',''))}' data-country='{_html_escape(b.get('country',''))}' data-league='{_html_escape(b.get('league_name',''))}' data-ev='{float(b.get('ev',0) or 0):.3f}' data-search='{_html_escape((str(b.get('home',''))+' '+str(b.get('away',''))+' '+str(b.get('league_name',''))+' '+str(b.get('country',''))).lower())}'>"
         )
-        parts.append(f"<div class='match'>{_html_escape(b.get('date',''))}{ko_txt} — {_html_escape(b.get('home',''))} vs {_html_escape(b.get('away',''))}</div>")
+        parts.append(f"<div class='match'>{_html_escape(b.get('date',''))}{ko_txt}</div>")
+        parts.append(_teamline_html(b.get('home',''), b.get('away','')))
         parts.append("<div class='row'>")
         parts.append(f"<span class='pill'>{_html_escape(b.get('bet_label',''))}</span>")
         parts.append(f"<span class='pill'>{_html_escape(b.get('league_name',''))}</span>")
@@ -1862,6 +2215,7 @@ button:hover{filter:brightness(1.08)}
         parts.append("</div>")
         parts.append(f"<div class='muted small' style='margin-top:8px'>Fair 1X2: H {float(b.get('fair_odds_h',0) or 0):.2f} · D {float(b.get('fair_odds_d',0) or 0):.2f} · A {float(b.get('fair_odds_a',0) or 0):.2f}</div>")
         parts.append(f"<div class='muted small' style='margin-top:4px'>Bookie 1X2: H {float(b.get('mkt_odds_h',0) or 0):.2f} · D {float(b.get('mkt_odds_d',0) or 0):.2f} · A {float(b.get('mkt_odds_a',0) or 0):.2f}</div>")
+        parts.append(_format_edge_line(b))
         parts.append(f"<div class='muted small' style='margin-top:6px'>xG: {_html_escape(b.get('home',''))} <b>{float(b.get('h_xg',0) or 0):.2f}</b> v <b>{float(b.get('a_xg',0) or 0):.2f}</b> {_html_escape(b.get('away',''))}</div>")
         books = b.get('top_books', []) or []
         if books:
@@ -1869,15 +2223,40 @@ button:hover{filter:brightness(1.08)}
         parts.append("</div>")
     parts.append("</div></div></div>")
 
+    # --- O/U opportunities tab ---
+    parts.append("<div id='tab_totals' class='section hidden'>")
+    parts.append("<div class='group'>")
+    parts.append("<div class='grouphead'><h2>Bookie vs Model O/U edges</h2><div class='muted small'>Best edge across available totals lines from football-data columns</div></div>")
+    if ou_opps:
+        parts.append("<div class='grid'>")
+        for o in ou_opps:
+            ko = (o.get('kickoff','') or '').strip()
+            ko_txt = f" {ko}" if ko else ""
+            parts.append(
+                f"<div class='card' data-kind='totals' data-date='{_html_escape(o.get('date',''))}' data-country='{_html_escape(o.get('country',''))}' data-league='{_html_escape(o.get('league_name',''))}' data-ev='{float(o.get('edge',0) or 0):.3f}' data-search='{_html_escape((str(o.get('home',''))+' '+str(o.get('away',''))+' '+str(o.get('league_name',''))+' '+str(o.get('country',''))).lower())}'>"
+            )
+            parts.append(f"<div class='match'>{_html_escape(o.get('date',''))}{ko_txt}</div>")
+            parts.append(_teamline_html(o.get('home',''), o.get('away','')))
+            parts.append(f"<div class='row' style='margin-top:6px'><span class='pill'>{_html_escape(o.get('best_side',''))}</span><span class='kv'>Edge: <b>{float(o.get('edge',0) or 0):+.1f}%</b></span></div>")
+            parts.append(f"<div class='muted small' style='margin-top:8px'>Model fair O/U line {float(o.get('line',2.5) or 2.5):.2f}: Over {float(o.get('fair_over',0) or 0):.2f} · Under {float(o.get('fair_under',0) or 0):.2f}</div>")
+            parts.append(f"<div class='muted small' style='margin-top:4px'>Market O/U line {float(o.get('line',2.5) or 2.5):.2f}: Over {float(o.get('mk_over',0) or 0):.2f} · Under {float(o.get('mk_under',0) or 0):.2f}</div>")
+            parts.append(f"<div class='muted small' style='margin-top:4px'>O EV: {float(o.get('over_ev',0) or 0):+.1f}% · U EV: {float(o.get('under_ev',0) or 0):+.1f}%</div>")
+            parts.append(f"<div class='books'>{_html_escape(o.get('tip',''))}</div>")
+            parts.append("</div>")
+        parts.append("</div>")
+    else:
+        parts.append(f"<div class='muted'>No O/U opportunities found above edge threshold. Fixtures with totals market: {fixtures_with_totals_market}.</div>")
+    parts.append("</div></div>")
+
     # --- Fixtures tab ---
     parts.append("<div id='tab_fixtures' class='section hidden'>")
     parts.append("<div class='group'>")
-    parts.append("<div class='grouphead'><h2>All Fixtures</h2><div class='muted small'>Model xG, Fair 1X2 (cal), Raw 1X2 (xG/DC), Market 1X2</div></div>")
+    parts.append("<div class='grouphead'><h2>All Fixtures</h2><div class='muted small'>Model xG (drives fair odds), Fair 1X2, Market 1X2</div></div>")
 
     if fixtures_sorted:
         parts.append("<div class='tablewrap'>")
         parts.append("<table class='table wide'>")
-        parts.append("<thead><tr><th>Date</th><th>KO</th><th>League</th><th>Match</th><th>xG</th><th>Fair H</th><th>Fair D</th><th>Fair A</th><th>Raw H</th><th>Raw D</th><th>Raw A</th><th>Mkt H</th><th>Mkt D</th><th>Mkt A</th><th>ΔP H</th><th>ΔP D</th><th>ΔP A</th><th>Mkt O/R</th><th>Conf</th><th>Form L5</th><th>xG Δ</th><th>xG Total</th></tr></thead><tbody>")
+        parts.append("<thead><tr><th>Date</th><th>KO</th><th>League</th><th>Match</th><th>xG</th><th>Fair H</th><th>Fair D</th><th>Fair A</th><th>Mkt H</th><th>Mkt D</th><th>Mkt A</th><th>ΔP H</th><th>ΔP D</th><th>ΔP A</th><th>Mkt O/R</th><th>Conf</th><th>Form L5</th><th>xG Δ</th><th>xG Total</th></tr></thead><tbody>")
         for f in fixtures_sorted:
             ko = (f.get('kickoff','') or '').strip()
             hxg = float(f.get('h_xg',0) or 0)
@@ -1886,10 +2265,6 @@ button:hover{filter:brightness(1.08)}
             fair_h = float(f.get('fair_odds_h',0) or 0)
             fair_d = float(f.get('fair_odds_d',0) or 0)
             fair_a = float(f.get('fair_odds_a',0) or 0)
-            raw_h = float(f.get('fair_odds_raw_h',0) or 0)
-            raw_d = float(f.get('fair_odds_raw_d',0) or 0)
-            raw_a = float(f.get('fair_odds_raw_a',0) or 0)
-
             mkt_h = float(f.get('mkt_odds_h',0) or 0)
             mkt_d = float(f.get('mkt_odds_d',0) or 0)
             mkt_a = float(f.get('mkt_odds_a',0) or 0)
@@ -1990,9 +2365,6 @@ button:hover{filter:brightness(1.08)}
                 f"<td>{fair_h:.2f}</td>"
                 f"<td>{fair_d:.2f}</td>"
                 f"<td>{fair_a:.2f}</td>"
-                f"<td>{raw_h:.2f}</td>"
-                f"<td>{raw_d:.2f}</td>"
-                f"<td>{raw_a:.2f}</td>"
                 + _td_market(mkt_h, ev_h, 'H')
                 + _td_market(mkt_d, ev_d, 'D')
                 + _td_market(mkt_a, ev_a, 'A')
@@ -2154,7 +2526,6 @@ button:hover{filter:brightness(1.08)}
             details_html = (
                 "<div class='detailwrap'>"
                 f"<div class='small muted'>Model probs (cal): H {prob_h*100:.1f}% · D {prob_d*100:.1f}% · A {prob_a*100:.1f}%"
-                f" &nbsp;|&nbsp; Raw probs: H {prob_raw_h*100:.1f}% · D {prob_raw_d*100:.1f}% · A {prob_raw_a*100:.1f}%"
                 f" &nbsp;|&nbsp; Most likely result (xG grid): {best_res[0]} ({best_res[1]*100:.1f}%)"
                 f" &nbsp;|&nbsp; Most likely score: {mh}-{ma} ({mp*100:.1f}%)"
                 f" &nbsp;|&nbsp; Market overround: {_overround()}"
@@ -2219,11 +2590,17 @@ function todayISO(){
 
 const fromDate = document.getElementById('fromDate');
 const toDate = document.getElementById('toDate');
+const datePreset = document.getElementById('datePreset');
 const countrySel = document.getElementById('countrySel');
 const leagueSel = document.getElementById('leagueSel');
 const minEv = document.getElementById('minEv');
 const search = document.getElementById('search');
 const shownCount = document.getElementById('shownCount');
+const countGrouped = document.getElementById('countGrouped');
+const countTime = document.getElementById('countTime');
+const countTotals = document.getElementById('countTotals');
+const countFixtures = document.getElementById('countFixtures');
+const chipButtons = Array.from(document.querySelectorAll('.chipbtn'));
 
 let activeTab = 'grouped';
 
@@ -2231,6 +2608,53 @@ let activeTab = 'grouped';
 const t = todayISO();
 if(fromDate && !fromDate.value) fromDate.value = t;
 if(toDate && !toDate.value) toDate.value = t;
+
+
+function addDaysISO(iso, n){
+  const d = parseDate(iso) || new Date();
+  d.setDate(d.getDate()+n);
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth()+1).padStart(2,'0');
+  const dd = String(d.getDate()).padStart(2,'0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+
+function setDatePreset(v){
+  if(!fromDate || !toDate) return;
+  if(v === 'custom') return;
+  const n = parseInt(v || '0', 10) || 0;
+  const t0 = todayISO();
+  fromDate.value = t0;
+  toDate.value = addDaysISO(t0, n);
+}
+
+if(datePreset){
+  setDatePreset(datePreset.value || '0');
+  datePreset.addEventListener('change', ()=>{
+    setDatePreset(datePreset.value || '0');
+    applyFilters();
+  });
+}
+
+for(const chip of chipButtons){
+  chip.addEventListener('click', ()=>{
+    if(chip.dataset.days !== undefined){
+      const base = todayISO();
+      const days = parseInt(chip.dataset.days || '0', 10) || 0;
+      if(fromDate) fromDate.value = base;
+      if(toDate) toDate.value = addDaysISO(base, days);
+      for(const c of chipButtons.filter(x=>x.dataset.days!==undefined)){ c.classList.remove('active'); }
+      chip.classList.add('active');
+    }
+    if(chip.dataset.ev !== undefined){
+      if(minEv) minEv.value = chip.dataset.ev;
+      for(const c of chipButtons.filter(x=>x.dataset.ev!==undefined)){ c.classList.remove('active'); }
+      chip.classList.add('active');
+    }
+    applyFilters();
+  });
+}
 
 function parseDate(s){
   if(!s) return null;
@@ -2243,6 +2667,7 @@ function setTab(tab){
   document.getElementById('tab_grouped').classList.toggle('hidden', tab !== 'grouped');
   document.getElementById('tab_time').classList.toggle('hidden', tab !== 'time');
   document.getElementById('tab_fixtures').classList.toggle('hidden', tab !== 'fixtures');
+  document.getElementById('tab_totals').classList.toggle('hidden', tab !== 'totals');
 
   for(const btn of document.querySelectorAll('.tabbtn')){
     btn.classList.toggle('active', btn.dataset.tab === tab);
@@ -2269,6 +2694,7 @@ function applyFilters(){
   const evMin = (minEv ? (parseFloat(minEv.value || '5') || 0) : 0);
 
   let shown = 0;
+  const kindCounts = {grouped:0, time:0, totals:0, fixtures:0};
 
   // collapse all fixture detail rows whenever filters change
   for(const dr of document.querySelectorAll('tr.detailrow')){ dr.style.display = 'none'; }
@@ -2299,16 +2725,23 @@ function applyFilters(){
     if(q && !hay.includes(q)) ok = false;
 
     el.style.display = ok ? '' : 'none';
-    if(ok) shown++;
+    if(ok){
+      shown++;
+      if(kindCounts[kind] !== undefined) kindCounts[kind]++;
+    }
   }
 
   if(shownCount) shownCount.textContent = String(shown);
+  if(countGrouped) countGrouped.textContent = String(kindCounts.grouped);
+  if(countTime) countTime.textContent = String(kindCounts.time);
+  if(countTotals) countTotals.textContent = String(kindCounts.totals);
+  if(countFixtures) countFixtures.textContent = String(kindCounts.fixtures);
 }
 
 for(const ctl of [fromDate, toDate, countrySel, leagueSel, minEv, search]){
   if(!ctl) continue;
-  ctl.addEventListener('input', applyFilters);
-  ctl.addEventListener('change', applyFilters);
+  ctl.addEventListener('input', ()=>{ if((ctl===fromDate || ctl===toDate) && datePreset) datePreset.value='custom'; applyFilters(); });
+  ctl.addEventListener('change', ()=>{ if((ctl===fromDate || ctl===toDate) && datePreset) datePreset.value='custom'; applyFilters(); });
 }
 
 const resetBtn = document.getElementById('resetBtn');
@@ -2317,6 +2750,7 @@ if(resetBtn){
     const t0 = todayISO();
     if(fromDate) fromDate.value = t0;
     if(toDate) toDate.value = t0;
+    if(datePreset) datePreset.value = '0';
     if(countrySel) countrySel.value = '';
     if(leagueSel) leagueSel.value = '';
     if(minEv) minEv.value = '5.0';
@@ -2343,6 +2777,12 @@ setTab('grouped');
     parts.append("</script>")
 
     parts.append("</div></body></html>")
+
+    try:
+        with open(logo_cache_path, 'wb') as cf:
+            pickle.dump(logo_cache, cf)
+    except Exception:
+        pass
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("".join(parts))
@@ -2521,6 +2961,9 @@ for league, fixtures in fixtures_data.items():
                     'home': {'xg5': recent_home_5, 'xg10': recent_home_10},
                     'away': {'xg5': recent_away_5, 'xg10': recent_away_10},
                 },
+                'mkt_totals': extract_market_totals_odds(row),
+                'mkt_btts': extract_market_btts_odds(row),
+                'mkt_ah': extract_market_ah_odds(row),
             })
 
             vals = model.find_value(pred, mkt)
@@ -2553,6 +2996,9 @@ for league, fixtures in fixtures_data.items():
                         'mkt_odds_d': median_market_price(all_books, 'D', fallback=float(fallback_mkt['D'] or 0)),
                         'mkt_odds_a': median_market_price(all_books, 'A', fallback=float(fallback_mkt['A'] or 0)),
                         'top_books': top_books,
+                        'model_prob': float((pred.get('probs', {}) or {}).get(v['out'], 0) or 0),
+                        'market_prob': (1.0 / float(v.get('mkt_o', 0) or 0)) if float(v.get('mkt_o', 0) or 0) > 0 else 0.0,
+                        'edge_pp': (float((pred.get('probs', {}) or {}).get(v['out'], 0) or 0) - ((1.0 / float(v.get('mkt_o', 0) or 0)) if float(v.get('mkt_o', 0) or 0) > 0 else 0.0)) * 100.0,
                     })
         except Exception:
             pass
@@ -2586,15 +3032,15 @@ if all_value_bets:
                 )
 
     print(f"\nTotal value bets found: {len(all_value_bets)}")
-
-# Optional HTML output
-    if args.html:
-        # Force the output to 'index.html' so it works with GitHub Pages
-        target_path = "output/index.html"
-        out_file = write_html_report(all_value_bets, all_fixture_preds, out_path=target_path)
-        print(f"\nHTML report written to: {out_file}")
 else:
     print("No value bets found.")
+
+# Optional HTML output (always write when requested, even if no bets)
+if args.html:
+    # Force the output to 'index.html' so it works with GitHub Pages
+    target_path = "output/index.html"
+    out_file = write_html_report(all_value_bets, all_fixture_preds, out_path=target_path)
+    print(f"\nHTML report written to: {out_file}")
 
 # Backtest Summary
 print("\n" + "="*60)
