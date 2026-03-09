@@ -1563,17 +1563,6 @@ def write_html_report(all_value_bets, all_fixtures=None, out_path="output/value_
             cls = 'low'
         return label, cls, score
 
-    def _teamline_html(home, away):
-        h = str(home or '')
-        a = str(away or '')
-        hl = team_logo_urls.get(h, '')
-        al = team_logo_urls.get(a, '')
-        hs = (h[:1] or '?').upper()
-        as_ = (a[:1] or '?').upper()
-        h_logo = f"<img class='teamlogo' src='{_html_escape(hl)}' loading='lazy' onerror='this.style.display=&quot;none&quot;;this.nextElementSibling.style.display=&quot;inline-flex&quot;'><span class='teamfallback'>{_html_escape(hs)}</span>" if hl else f"<span class='teamfallback'>{_html_escape(hs)}</span>"
-        a_logo = f"<img class='teamlogo' src='{_html_escape(al)}' loading='lazy' onerror='this.style.display=&quot;none&quot;;this.nextElementSibling.style.display=&quot;inline-flex&quot;'><span class='teamfallback'>{_html_escape(as_)}</span>" if al else f"<span class='teamfallback'>{_html_escape(as_)}</span>"
-        return f"<div class='teamline'><span class='logo'>{h_logo}</span><span>{_html_escape(h)}</span><span class='muted'>vs</span><span class='logo'>{a_logo}</span><span>{_html_escape(a)}</span></div>"
-
     def _format_edge_line(b):
         model_prob = float(b.get('model_prob', 0) or 0)
         market_prob = float(b.get('market_prob', 0) or 0)
@@ -1785,6 +1774,7 @@ h1{margin:0 0 10px 0; font-size:28px; letter-spacing:0.2px}
 .ctl{display:flex; flex-direction:column; gap:6px}
 .ctl.search-ctl{grid-column:span 2}
 label{font-size:12px; color:#4b5563}
+label{font-size:12px; color:#c4cfe5}
 input,select{
   padding:10px 10px;
   border-radius:12px;
@@ -1836,6 +1826,8 @@ button:hover{background:#f8fafc}
 .grid{display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:12px}
 .card{border:1px solid rgba(15,23,42,.12); border-radius:16px; padding:12px 14px; background:#ffffff}
 .card:hover{border-color:rgba(15,23,42,.24)}
+.card{border:1px solid rgba(255,255,255,.12); border-radius:16px; padding:12px 14px; background:rgba(13,19,36,.75)}
+.card:hover{border-color:rgba(255,255,255,.22)}
 .match{font-weight:750; font-size:14px; margin-bottom:6px}
 .teamline{display:flex;align-items:center;gap:7px;margin-top:4px;font-size:12px;color:var(--muted)}
 .teamlogo{width:18px;height:18px;object-fit:contain;border-radius:50%;background:rgba(255,255,255,.9);padding:1px}
@@ -1852,6 +1844,7 @@ button:hover{background:#f8fafc}
 .quickchips{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
 .chipbtn{padding:7px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.06);color:var(--text);font-size:12px;cursor:pointer}
 .chipbtn.active{background:#e8f0ff;border-color:#b7cdfa}
+.chipbtn.active{background:rgba(155,209,255,.18);border-color:rgba(155,209,255,.35)}
 .table{width:100%; border-collapse:collapse; margin-top:10px; overflow:auto;}
 .table th,.table td{border-bottom:1px solid rgba(255,255,255,.10); padding:8px 10px; text-align:left; font-size:13px;}
 .table th{color:#334155; font-weight:700; position:sticky; top:0; background:#f8fafc}
