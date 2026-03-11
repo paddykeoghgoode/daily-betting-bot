@@ -1795,6 +1795,7 @@ def write_html_report(all_value_bets, all_fixtures=None, out_path="output/value_
     team_logo_urls = {t: _lookup_team_logo_svg(t, logo_cache) for t in all_teams}
 
     ou_opps = []
+    ou_market_rows = []
     fixtures_with_totals_market = 0
     for f in fixtures_sorted:
         try:
@@ -1836,25 +1837,43 @@ def write_html_report(all_value_bets, all_fixtures=None, out_path="output/value_
                         'edge': edge,
                     }
 
-            if not best or best['edge'] < 0.03:
+            if not best:
                 continue
+
+            model_total_xg = hxg + axg
+            market_over_prob = (1.0 / best['mk_over']) if best['mk_over'] > 1.01 else 0.0
+            market_under_prob = (1.0 / best['mk_under']) if best['mk_under'] > 1.01 else 0.0
+            model_over_prob = (1.0 / best['fair_over']) if best['fair_over'] > 1.01 else 0.0
+            model_under_prob = (1.0 / best['fair_under']) if best['fair_under'] > 1.01 else 0.0
 
             side_line = f"{best['best_side']} {best['line']:.2f}"
             pick_odds = best['mk_over'] if best['best_side'] == 'Over' else best['mk_under']
             tip = f"Lean {side_line} if odds stay ≥ {max(pick_odds, 1.01):.2f}"
-            ou_opps.append({
+            market_row = {
                 'date': f.get('date', ''), 'kickoff': f.get('kickoff', ''), 'country': f.get('country', ''),
                 'league_name': f.get('league_name', ''), 'home': f.get('home', ''), 'away': f.get('away', ''),
                 'h_xg': hxg, 'a_xg': axg,
+                'model_total_xg': model_total_xg,
                 'line': best['line'],
                 'fair_over': best['fair_over'], 'fair_under': best['fair_under'],
                 'mk_over': best['mk_over'], 'mk_under': best['mk_under'],
+                'market_over_prob': market_over_prob * 100.0,
+                'market_under_prob': market_under_prob * 100.0,
+                'model_over_prob': model_over_prob * 100.0,
+                'model_under_prob': model_under_prob * 100.0,
                 'over_ev': best['over_ev']*100.0, 'under_ev': best['under_ev']*100.0,
                 'best_side': side_line, 'edge': best['edge']*100.0, 'tip': tip,
-            })
+            }
+            ou_market_rows.append(market_row)
+
+            if best['edge'] < 0.03:
+                continue
+
+            ou_opps.append(market_row)
         except Exception:
             pass
     ou_opps = sorted(ou_opps, key=lambda x: -float(x.get('edge', 0) or 0))
+    ou_market_rows = sorted(ou_market_rows, key=lambda x: -float(x.get('edge', 0) or 0))
 
     # Filter controls lists (union from bets + fixtures)
     countries = sorted({*(b.get('country', 'Unknown') for b in bets_time_sorted), *(f.get('country', 'Unknown') for f in fixtures_sorted)})
@@ -1889,14 +1908,14 @@ def write_html_report(all_value_bets, all_fixtures=None, out_path="output/value_
     parts.append("/* All Fixtures: highlight biggest market-vs-fair differences */\ntd.bestedge{box-shadow: inset 0 0 0 2px rgba(255,255,255,.28); }\n")
     parts.append(r"""
 :root{
-  --bg:#f6f7fb;
+  --bg:#f3f4f6;
   --panel:#ffffff;
-  --panel2:#f9fafc;
-  --text:#1f2937;
-  --muted:#6b7280;
-  --line:rgba(15,23,42,.12);
-  --pill:rgba(15,23,42,.06);
-  --shadow: 0 8px 24px rgba(15,23,42,.08);
+  --panel2:#f8fafc;
+  --text:#0f172a;
+  --muted:#475569;
+  --line:rgba(15,23,42,.22);
+  --pill:rgba(15,23,42,.07);
+  --shadow: 0 6px 18px rgba(15,23,42,.08);
 }
 *{box-sizing:border-box;}
 body{
@@ -1909,10 +1928,10 @@ body{
 h1{margin:0 0 10px 0; font-size:28px; letter-spacing:0.2px}
 .muted{color:var(--muted)}
 
-.sticky{position:sticky; top:0; z-index:10; backdrop-filter: blur(10px);}
+.sticky{position:sticky; top:0; z-index:20; background:rgba(243,244,246,.96); backdrop-filter: blur(4px); border-bottom:1px solid var(--line);}
 .toolbar{
-  margin:14px 0 14px 0;
-  padding:14px;
+  margin:10px 0 10px 0;
+  padding:10px 12px;
   border:1px solid var(--line);
   border-radius:14px;
   background:#ffffff;
@@ -1990,26 +2009,26 @@ button:hover{background:#f8fafc}
 .summarybar{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
 .statpill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12px;border:1px solid rgba(15,23,42,.14);background:#f8fafc;color:#334155}
 .statpill b{font-size:12px}
-.chipbtn{padding:7px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.06);color:var(--text);font-size:12px;cursor:pointer}
+.chipbtn{padding:7px 10px;border-radius:999px;border:1px solid rgba(15,23,42,.22);background:#ffffff;color:var(--text);font-size:12px;cursor:pointer}
 .chipbtn.active{background:#e8f0ff;border-color:#b7cdfa}
 .table{width:100%; border-collapse:collapse; margin-top:10px; overflow:auto;}
-.table th,.table td{border-bottom:1px solid rgba(255,255,255,.10); padding:8px 10px; text-align:left; font-size:13px;}
+.table th,.table td{border-bottom:1px solid rgba(15,23,42,.14); padding:8px 10px; text-align:left; font-size:13px;}
 .table th{color:#334155; font-weight:700; position:sticky; top:0; background:#f8fafc}
 .tablewrap{width:100%; overflow-x:auto}
 .table.wide{min-width:1780px}
 .stats-table th,.stats-table td{font-size:12px}
 .stats-table td.team{font-weight:700}
 .stats-table td.scope{color:var(--muted)}
-.stats-table{border:1px solid rgba(255,255,255,.18);border-radius:12px;overflow:hidden}
+.stats-table{border:1px solid rgba(15,23,42,.16);border-radius:12px;overflow:hidden}
 .stats-table thead th{background:#f8fafc}
-.stats-table tbody tr{border-bottom:1px solid rgba(255,255,255,.12)}
+.stats-table tbody tr{border-bottom:1px solid rgba(15,23,42,.12)}
 .stats-table tbody tr:last-child{border-bottom:none}
-.stats-table td,.stats-table th{border-right:1px solid rgba(255,255,255,.10)}
+.stats-table td,.stats-table th{border-right:1px solid rgba(15,23,42,.10)}
 .stats-table td:last-child,.stats-table th:last-child{border-right:none}
-.value-badge{display:inline-flex;align-items:center;margin-left:6px;padding:1px 6px;border-radius:999px;font-size:10px;font-weight:700;border:1px solid rgba(34,197,94,.35);color:#9ef3c2;background:rgba(34,197,94,.12)}
-.value-badge.neg{border-color:rgba(239,68,68,.35);color:#fecaca;background:rgba(239,68,68,.12)}
-.edge-pos{color:#9ef3c2}
-.edge-neg{color:#fecaca}
+.value-badge{display:inline-flex;align-items:center;margin-left:6px;padding:1px 6px;border-radius:999px;font-size:10px;font-weight:700;border:1px solid rgba(22,163,74,.45);color:#166534;background:rgba(187,247,208,.75)}
+.value-badge.neg{border-color:rgba(220,38,38,.45);color:#991b1b;background:rgba(254,226,226,.85)}
+.edge-pos{color:#15803d}
+.edge-neg{color:#b91c1c}
 .tag{display:inline-flex;align-items:center;border-radius:999px;padding:2px 8px;font-size:11px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.08)}
 .tag.low{background:rgba(239,68,68,.16);border-color:rgba(239,68,68,.32)}
 .tag.med{background:rgba(234,179,8,.18);border-color:rgba(234,179,8,.32)}
@@ -2032,7 +2051,7 @@ button:hover{background:#f8fafc}
 .sg-axis{display:flex;justify-content:space-between;font-size:11px;opacity:.78;margin-top:6px}
 
 @media (max-width: 900px){
-  .sticky{position:static; backdrop-filter:none;}
+  .sticky{position:sticky; top:0; backdrop-filter:none;}
   .container{padding:16px 12px 56px;}
   h1{font-size:24px;}
   .group{padding:12px; border-radius:14px;}
@@ -2104,7 +2123,7 @@ button:hover{background:#f8fafc}
     parts.append("<button class='tabbtn active' data-tab='grouped'>Value Bets (Grouped)</button>")
     parts.append("<button class='tabbtn' data-tab='time'>Bets by Time</button>")
     parts.append("<button class='tabbtn' data-tab='fixtures'>All Fixtures (xG)</button>")
-    parts.append("<button class='tabbtn' data-tab='totals'>O/U edges</button>")
+    parts.append("<button class='tabbtn' data-tab='totals'>O/U market vs model</button>")
     parts.append("</div>")
 
     parts.append("<div class='summarybar'>")
@@ -2226,7 +2245,7 @@ button:hover{background:#f8fafc}
     # --- O/U opportunities tab ---
     parts.append("<div id='tab_totals' class='section hidden'>")
     parts.append("<div class='group'>")
-    parts.append("<div class='grouphead'><h2>Bookie vs Model O/U edges</h2><div class='muted small'>Best edge across available totals lines from football-data columns</div></div>")
+    parts.append("<div class='grouphead'><h2>Bookie vs Model O/U (market vs model)</h2><div class='muted small'>Shows every fixture with totals market. Edge is EV vs model fair odds at the best available goal line.</div></div>")
     if ou_opps:
         parts.append("<div class='grid'>")
         for o in ou_opps:
@@ -2245,18 +2264,30 @@ button:hover{background:#f8fafc}
             parts.append("</div>")
         parts.append("</div>")
     else:
-        parts.append(f"<div class='muted'>No O/U opportunities found above edge threshold. Fixtures with totals market: {fixtures_with_totals_market}.</div>")
+        parts.append(f"<div class='muted'>No O/U rows available. Fixtures with totals market: {fixtures_with_totals_market}.</div>")
+    if ou_market_rows:
+        parts.append("<div class='group' style='margin-top:12px'>")
+        parts.append("<div class='grouphead'><h2>All totals markets (with xG and line context)</h2><div class='muted small'>Implied % uses 1/odds. A 2.00 over price means ~50% chance of Over at that line, not a prediction of exactly that many goals.</div></div>")
+        parts.append("<div class='tablewrap'><table class='table wide'><thead><tr><th>Date</th><th>KO</th><th>League</th><th>Match</th><th>xG (H-A)</th><th>xG Total</th><th>Goal line</th><th>Mkt O</th><th>Mkt U</th><th>Mkt O%</th><th>Mdl O%</th><th>O EV</th><th>Mkt U%</th><th>Mdl U%</th><th>U EV</th><th>Best edge</th></tr></thead><tbody>")
+        for o in ou_market_rows:
+            ko = (o.get('kickoff','') or '').strip()
+            parts.append(
+                f"<tr data-kind='totals' data-date='{_html_escape(o.get('date',''))}' data-country='{_html_escape(o.get('country',''))}' data-league='{_html_escape(o.get('league_name',''))}' data-ev='{float(o.get('edge',0) or 0):.3f}' data-search='{_html_escape((str(o.get('home',''))+' '+str(o.get('away',''))+' '+str(o.get('league_name',''))+' '+str(o.get('country',''))).lower())}'><td>{_html_escape(o.get('date',''))}</td><td>{_html_escape(ko)}</td><td>{_html_escape(o.get('league_name',''))}</td><td>{_html_escape(o.get('home',''))} vs {_html_escape(o.get('away',''))}</td><td>{float(o.get('h_xg',0) or 0):.2f} - {float(o.get('a_xg',0) or 0):.2f}</td><td>{float(o.get('model_total_xg',0) or 0):.2f}</td><td>{float(o.get('line',0) or 0):.2f}</td><td>{float(o.get('mk_over',0) or 0):.2f}</td><td>{float(o.get('mk_under',0) or 0):.2f}</td><td>{float(o.get('market_over_prob',0) or 0):.1f}%</td><td>{float(o.get('model_over_prob',0) or 0):.1f}%</td><td>{float(o.get('over_ev',0) or 0):+.1f}%</td><td>{float(o.get('market_under_prob',0) or 0):.1f}%</td><td>{float(o.get('model_under_prob',0) or 0):.1f}%</td><td>{float(o.get('under_ev',0) or 0):+.1f}%</td><td><b>{float(o.get('edge',0) or 0):+.1f}%</b> ({_html_escape(o.get('best_side',''))})</td></tr>"
+            )
+        parts.append("</tbody></table></div>")
+        parts.append("</div>")
+
     parts.append("</div></div>")
 
     # --- Fixtures tab ---
     parts.append("<div id='tab_fixtures' class='section hidden'>")
     parts.append("<div class='group'>")
-    parts.append("<div class='grouphead'><h2>All Fixtures</h2><div class='muted small'>Model xG (drives fair odds), Fair 1X2, Market 1X2</div></div>")
+    parts.append("<div class='grouphead'><h2>All Fixtures</h2><div class='muted small'>Model xG drives the scoreline distribution, which maps to fair 1X2 odds. ΔP columns are model probability minus market implied probability.</div></div>")
 
     if fixtures_sorted:
         parts.append("<div class='tablewrap'>")
         parts.append("<table class='table wide'>")
-        parts.append("<thead><tr><th>Date</th><th>KO</th><th>League</th><th>Match</th><th>xG</th><th>Fair H</th><th>Fair D</th><th>Fair A</th><th>Mkt H</th><th>Mkt D</th><th>Mkt A</th><th>ΔP H</th><th>ΔP D</th><th>ΔP A</th><th>Mkt O/R</th><th>Conf</th><th>Form L5</th><th>xG Δ</th><th>xG Total</th></tr></thead><tbody>")
+        parts.append("<thead><tr><th>Date</th><th>KO</th><th>League</th><th>Match</th><th>xG (H-A)</th><th>Fair H</th><th>Fair D</th><th>Fair A</th><th>Mkt H</th><th>Mkt D</th><th>Mkt A</th><th>ΔP H</th><th>ΔP D</th><th>ΔP A</th><th>Mkt O/R</th><th>Conf</th><th>Form L5</th><th>xG Δ</th><th>xG Total</th></tr></thead><tbody>")
         for f in fixtures_sorted:
             ko = (f.get('kickoff','') or '').strip()
             hxg = float(f.get('h_xg',0) or 0)
@@ -2287,21 +2318,20 @@ button:hover{background:#f8fafc}
             best_key, best_ev = max([('H', ev_h), ('D', ev_d), ('A', ev_a)], key=lambda t: abs(t[1]))
 
             def _cell_style(ev):
-                # Color scale: green positive (market bigger than fair), red negative.
-                # White/transparent for small differences.
+                # Stronger contrast while keeping a white-first palette.
                 try:
                     ev=float(ev)
                 except Exception:
                     return ''
-                if abs(ev) < 0.02:
+                if abs(ev) < 0.01:
                     return ''
-                cap = 0.25
+                cap = 0.20
                 intensity = min(abs(ev)/cap, 1.0)
-                alpha = 0.10 + 0.35*intensity
                 if ev > 0:
-                    return f"background-color: rgba(34,197,94,{alpha:.3f});"
-                else:
-                    return f"background-color: rgba(239,68,68,{alpha:.3f});"
+                    bg = int(240 - (55 * intensity))
+                    return f"background-color: rgb({bg}, 252, {bg}); color:#14532d; font-weight:600;"
+                bg = int(255 - (35 * intensity))
+                return f"background-color: rgb(255, {bg}, {bg}); color:#7f1d1d; font-weight:600;"
 
             def _td_market(val, ev, key):
                 cls = 'bestedge' if key == best_key else ''
