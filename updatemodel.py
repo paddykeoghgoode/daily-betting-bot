@@ -32,6 +32,7 @@ Just run this entire script in Google Colab!
 
 import os
 import argparse
+import json
 from datetime import datetime
 import pickle
 import re
@@ -83,6 +84,13 @@ RHO_BOUNDS = (-0.3, 0.3)
 MIN_TRAIN_MATCHES = 50
 MIN_FAIR_ODDS = 1.01
 MAX_FAIR_ODDS = 50.0
+
+# Conservative value-bet filters (risk control)
+MIN_EDGE_PP = 2.0            # require at least +2.0 percentage points model edge
+MAX_VALUE_ODDS = 8.0         # avoid extreme longshots that inflate noisy EV
+KELLY_FRACTION = 0.25        # quarter-Kelly staking
+MAX_STAKE_PCT = 0.03         # cap any single bet at 3% bankroll
+MIN_CONFIDENCE = 0.55        # skip low-confidence predictions
 
 # --- Blending + stability knobs (best-of-both worlds) ---
 DC_MIN_WEIGHT = 0.01          # time-decay floor for DC MLE (lower = old matches matter less)
@@ -137,7 +145,7 @@ LEAGUE_EV_THRESH = {
 
 # Model caching
 MODEL_CACHE_DIR = "output/models"
-MODEL_VERSION = "dc_mle_v1"  # bump to invalidate cached models when logic changes
+MODEL_VERSION = "dc_mle_v5"  # bump to invalidate cached models when logic changes
 
 # Fixtures caching
 FIXTURES_URL = "https://www.football-data.co.uk/fixtures.xlsx"
@@ -1021,20 +1029,37 @@ class LeagueModel:
 
         return True
     def _fit_calibration(self, df):
+        # Fit isotonic calibration using only pre-match history for each row.
+        # This avoids target leakage from using future rows when collecting
+        # probabilities for the calibration targets.
         df_c = df.dropna(subset=['FTR', 'HomeTeam', 'AwayTeam']).copy()
         if len(df_c) < 120:
             return
-        sample = df_c.tail(700)
+
+        if 'Date' in df_c.columns:
+            df_c = df_c.sort_values('Date').reset_index(drop=True)
+        else:
+            df_c = df_c.reset_index(drop=True)
+
+        sample_start = max(0, len(df_c) - 700)
         probs = {'H': [], 'D': [], 'A': []}
         outcomes = {'H': [], 'D': [], 'A': []}
-        for _, row in sample.iterrows():
+
+        for pos in range(sample_start, len(df_c)):
+            row = df_c.iloc[pos]
             ht = row.get('HomeTeam')
             at = row.get('AwayTeam')
             if pd.isna(ht) or pd.isna(at):
                 continue
-            pred = self.predict(ht, at, df, apply_calibration=False)
+
+            history = df_c.iloc[:pos]
+            if len(history) < MIN_TRAIN_MATCHES:
+                continue
+
+            pred = self.predict(ht, at, history, apply_calibration=False)
             if pred is None:
                 continue
+
             for out in ['H', 'D', 'A']:
                 probs[out].append(float(pred['probs'][out]))
                 outcomes[out].append(1.0 if row.get('FTR') == out else 0.0)
@@ -1175,6 +1200,15 @@ class LeagueModel:
         odds_raw = {k: _odds_from_prob(v) for k, v in probs_raw.items()}
         odds_final = {k: _odds_from_prob(v) for k, v in probs.items()}
 
+        # Confidence proxy using only information available at prediction time.
+        h_n = float(hs.get('n', 0) or 0)
+        a_n = float(aws.get('n', 0) or 0)
+        sample_conf = float(np.clip(min(h_n, a_n) / 12.0, 0.0, 1.0))
+        disagreement = abs(np.log(max(h_lam_dc or h_lam_ratio, 1e-6) / max(h_lam_ratio, 1e-6))) + abs(np.log(max(a_lam_dc or a_lam_ratio, 1e-6) / max(a_lam_ratio, 1e-6)))
+        agree_conf = float(np.clip(1.0 - (disagreement / 1.5), 0.0, 1.0))
+        cal_conf = 1.0 if self.calibrators else 0.5
+        pred_conf = float(np.clip(0.5 * sample_conf + 0.3 * agree_conf + 0.2 * cal_conf, 0.0, 1.0))
+
         return {
             'home': ht, 'away': at, 'league': self.league,
             'h_xg': h_lam, 'a_xg': a_lam,
@@ -1183,6 +1217,7 @@ class LeagueModel:
             'probs_raw': probs_raw,
             'odds_raw': odds_raw,
             'odds_final': odds_final,
+            'confidence': pred_conf,
             'strength': {
                 **dc_meta,
                 'blend_w': blend_w,
@@ -1200,14 +1235,39 @@ class LeagueModel:
             thresh = get_ev_threshold(self.league, default=VALUE_THRESHOLD)
         vals = []
         for out in ['H', 'D', 'A']:
-            mp = pred['probs'][out]
-            mo = mkt_odds.get(out, 0)
-            if mo > 0 and mo < 50:  # Filter bad odds
-                ev = mp * mo - 1
-                vals.append({
-                    'out': out, 'model_p': mp, 'model_o': pred['odds'][out],
-                    'mkt_o': mo, 'ev': ev*100, 'value': ev >= float(thresh)
-                })
+            mp = float(pred['probs'].get(out, 0) or 0)
+            mo = float(mkt_odds.get(out, 0) or 0)
+            if mo <= 0 or mo >= 50:
+                continue
+
+            ev = (mp * mo) - 1.0
+            market_p = (1.0 / mo) if mo > 0 else 0.0
+            edge_pp = (mp - market_p) * 100.0
+
+            # Fractional Kelly: f* = (bp-q)/b where b=odds-1, q=1-p
+            b = max(mo - 1.0, 1e-9)
+            kelly_full = max(0.0, ((b * mp) - (1.0 - mp)) / b)
+            stake_pct = min(MAX_STAKE_PCT, KELLY_FRACTION * kelly_full)
+
+            pred_conf = float(pred.get('confidence', 0.5) or 0.5)
+            score = max(0.0, ev * 100.0) * max(0.0, edge_pp) * pred_conf
+
+            # Conservative filters: threshold EV + minimum edge + odds sanity + confidence floor
+            is_value = (ev >= float(thresh)) and (edge_pp >= float(MIN_EDGE_PP)) and (mo <= float(MAX_VALUE_ODDS)) and (pred_conf >= float(MIN_CONFIDENCE))
+
+            vals.append({
+                'out': out,
+                'model_p': mp,
+                'model_o': pred['odds'][out],
+                'mkt_o': mo,
+                'ev': ev * 100,
+                'edge_pp': edge_pp,
+                'stake_pct': stake_pct * 100.0,
+                'kelly_full_pct': kelly_full * 100.0,
+                'confidence': pred_conf,
+                'bet_score': score,
+                'value': is_value,
+            })
         return vals
 
 # =============================================================================
@@ -1506,7 +1566,7 @@ def print_pred(p, mkt=None, vals=None):
         for v in vals:
             if v['value']:
                 # v['model_o'] is fair odds from model
-                print(f"  >>> VALUE: {v['out']} @ {v['mkt_o']:.2f} (EV: {v['ev']:+.1f}%) | Fair: {v['model_o']:.2f}")
+                print(f"  >>> VALUE: {v['out']} @ {v['mkt_o']:.2f} (EV: {v['ev']:+.1f}%, Edge: {v.get('edge_pp', 0):+.1f}pp) | Fair: {v['model_o']:.2f} | Stake: {v.get('stake_pct', 0):.2f}% br | Conf: {v.get('confidence', 0):.2f}")
 
 # =============================================================================
 # HTML REPORT
@@ -1564,7 +1624,7 @@ def _lookup_team_logo_svg(team_name, cache):
     return ''
 
 
-def write_html_report(all_value_bets, all_fixtures=None, out_path="output/value_bets.html"):
+def write_html_report(all_value_bets, all_fixtures=None, out_path="output/value_bets.html", hypothetical_fixtures=None):
     """Write a standalone HTML report with tabs + filtering UI.
 
     Tabs:
@@ -1692,7 +1752,7 @@ def write_html_report(all_value_bets, all_fixtures=None, out_path="output/value_
         return (
             f"<div class='muted small' style='margin-top:4px'>"
             f"Model P: <b>{model_prob*100:.1f}%</b> · Market Implied: <b>{market_prob*100:.1f}%</b> · "
-            f"Edge: <b class='{edge_cls}'>{edge_pp:+.1f}pp</b></div>"
+            f"Edge: <b class='{edge_cls}'>{edge_pp:+.1f}pp</b> · Stake: <b>{float(b.get('stake_pct', 0) or 0):.2f}% br</b> · Conf: <b>{float(b.get('confidence', 0) or 0):.2f}</b></div>"
         )
 
     def _render_recent_form_table(fix):
@@ -1783,6 +1843,27 @@ def write_html_report(all_value_bets, all_fixtures=None, out_path="output/value_
         )
     )
 
+    hypo_rows = list(hypothetical_fixtures or [])
+    hypo_payload = []
+    for r in hypo_rows:
+        try:
+            hypo_payload.append({
+                'league': str(r.get('league', '') or ''),
+                'league_name': str(r.get('league_name', '') or ''),
+                'home': str(r.get('home', '') or ''),
+                'away': str(r.get('away', '') or ''),
+                'h_xg': float(r.get('h_xg', 0) or 0),
+                'a_xg': float(r.get('a_xg', 0) or 0),
+                'odds_h': float(r.get('odds_h', 0) or 0),
+                'odds_d': float(r.get('odds_d', 0) or 0),
+                'odds_a': float(r.get('odds_a', 0) or 0),
+                'prob_h': float(r.get('prob_h', 0) or 0),
+                'prob_d': float(r.get('prob_d', 0) or 0),
+                'prob_a': float(r.get('prob_a', 0) or 0),
+                'confidence': float(r.get('confidence', 0) or 0),
+            })
+        except Exception:
+            continue
 
     all_teams = set()
     for b in bets_time_sorted:
@@ -2014,6 +2095,8 @@ button:hover{background:#f8fafc}
 .table{width:100%; border-collapse:collapse; margin-top:10px; overflow:auto;}
 .table th,.table td{border-bottom:1px solid rgba(15,23,42,.14); padding:8px 10px; text-align:left; font-size:13px;}
 .table th{color:#334155; font-weight:700; position:sticky; top:0; background:#f8fafc}
+.table th.sort-asc::after{content:' ▲';font-size:11px;color:#334155}
+.table th.sort-desc::after{content:' ▼';font-size:11px;color:#334155}
 .tablewrap{width:100%; overflow-x:auto}
 .table.wide{min-width:1780px}
 .stats-table th,.stats-table td{font-size:12px}
@@ -2285,9 +2368,19 @@ button:hover{background:#f8fafc}
     parts.append("<div class='grouphead'><h2>All Fixtures</h2><div class='muted small'>Model xG drives the scoreline distribution, which maps to fair 1X2 odds. ΔP columns are model probability minus market implied probability.</div></div>")
 
     if fixtures_sorted:
+        parts.append("<div class='card' style='margin-bottom:10px'>")
+        parts.append("<div class='match'><b>Hypothetical fixture tool</b> <span class='muted small'>Pick league + teams to get model xG and fair 1X2 odds (no market odds needed).</span></div>")
+        parts.append("<div class='filters' style='padding:8px 0 0 0'>")
+        parts.append("<div class='ctl'><label>League</label><select id='hypoLeague'></select></div>")
+        parts.append("<div class='ctl'><label>Home team</label><select id='hypoHome'></select></div>")
+        parts.append("<div class='ctl'><label>Away team</label><select id='hypoAway'></select></div>")
+        parts.append("</div>")
+        parts.append("<div id='hypoResult' class='muted small' style='margin-top:8px'>Select a league and teams.</div>")
+        parts.append("</div>")
+
         parts.append("<div class='tablewrap'>")
-        parts.append("<table class='table wide'>")
-        parts.append("<thead><tr><th>Date</th><th>KO</th><th>League</th><th>Match</th><th>xG (H-A)</th><th>Fair H</th><th>Fair D</th><th>Fair A</th><th>Mkt H</th><th>Mkt D</th><th>Mkt A</th><th>ΔP H</th><th>ΔP D</th><th>ΔP A</th><th>Mkt O/R</th><th>Conf</th><th>Form L5</th><th>xG Δ</th><th>xG Total</th></tr></thead><tbody>")
+        parts.append("<table id='fixturesTable' class='table wide'>")
+        parts.append("<thead><tr><th data-sort='date'>Date</th><th data-sort='text'>KO</th><th data-sort='text'>League</th><th data-sort='text'>Match</th><th data-sort='num'>xG (H-A)</th><th data-sort='num'>Fair H</th><th data-sort='num'>Fair D</th><th data-sort='num'>Fair A</th><th data-sort='num'>Mkt H</th><th data-sort='num'>Mkt D</th><th data-sort='num'>Mkt A</th><th data-sort='num'>ΔP H</th><th data-sort='num'>ΔP D</th><th data-sort='num'>ΔP A</th><th data-sort='num'>Mkt O/R</th><th data-sort='text'>Conf</th><th data-sort='text'>Form L5</th><th data-sort='num'>xG Δ</th><th data-sort='num'>xG Total</th></tr></thead><tbody>")
         for f in fixtures_sorted:
             ko = (f.get('kickoff','') or '').strip()
             hxg = float(f.get('h_xg',0) or 0)
@@ -2609,6 +2702,7 @@ button:hover{background:#f8fafc}
 
     # JS: tabs + filters
     parts.append("<script>")
+    parts.append("const HYPOTHETICAL_DATA = " + json.dumps(hypo_payload) + ";")
     parts.append(r"""
 function todayISO(){
   const d = new Date();
@@ -2802,6 +2896,121 @@ document.addEventListener('click', (ev)=>{
   }
 });
 
+
+function setupFixturesSorting(){
+  const table = document.getElementById('fixturesTable');
+  if(!table) return;
+  const tbody = table.querySelector('tbody');
+  const headers = Array.from(table.querySelectorAll('thead th'));
+  let sortIdx = -1;
+  let sortDir = 1;
+
+  function parseVal(text, typ){
+    const t = (text || '').trim();
+    if(typ === 'date'){
+      const d = new Date(t+'T00:00:00');
+      return isNaN(d.getTime()) ? 0 : d.getTime();
+    }
+    if(typ === 'num'){
+      const n = parseFloat(t.replace(/[^0-9+\-.]/g,''));
+      return isNaN(n) ? -999999 : n;
+    }
+    return t.toLowerCase();
+  }
+
+  headers.forEach((th, idx)=>{
+    th.style.cursor = 'pointer';
+    th.title = 'Sort';
+    th.addEventListener('click', ()=>{
+      const typ = th.dataset.sort || 'text';
+      sortDir = (sortIdx === idx) ? -sortDir : 1;
+      sortIdx = idx;
+
+      headers.forEach(h=>h.classList.remove('sort-asc','sort-desc'));
+      th.classList.add(sortDir === 1 ? 'sort-asc' : 'sort-desc');
+
+      const pairs = [];
+      for(const row of Array.from(tbody.querySelectorAll('tr.fixrow'))){
+        const detail = (row.nextElementSibling && row.nextElementSibling.classList.contains('detailrow')) ? row.nextElementSibling : null;
+        const cell = row.children[idx];
+        const key = parseVal(cell ? cell.textContent : '', typ);
+        pairs.push({row, detail, key});
+      }
+
+      pairs.sort((a,b)=>{
+        if(a.key < b.key) return -1 * sortDir;
+        if(a.key > b.key) return 1 * sortDir;
+        return 0;
+      });
+
+      for(const p of pairs){
+        tbody.appendChild(p.row);
+        if(p.detail) tbody.appendChild(p.detail);
+      }
+      applyFilters();
+    });
+  });
+}
+
+function setupHypotheticalTool(){
+  const leagueEl = document.getElementById('hypoLeague');
+  const homeEl = document.getElementById('hypoHome');
+  const awayEl = document.getElementById('hypoAway');
+  const outEl = document.getElementById('hypoResult');
+  if(!leagueEl || !homeEl || !awayEl || !outEl) return;
+
+  const rows = Array.isArray(HYPOTHETICAL_DATA) ? HYPOTHETICAL_DATA : [];
+  const leagues = {};
+  const rowMap = {};
+  for(const r of rows){
+    const lg = r.league || '';
+    if(!lg) continue;
+    if(!leagues[lg]) leagues[lg] = {name: r.league_name || lg, teams: new Set()};
+    leagues[lg].teams.add(r.home || '');
+    leagues[lg].teams.add(r.away || '');
+    rowMap[`${lg}||${r.home}||${r.away}`] = r;
+  }
+
+  const lgKeys = Object.keys(leagues).sort((a,b)=> String(leagues[a].name).localeCompare(String(leagues[b].name)));
+  leagueEl.innerHTML = lgKeys.map(lg=>`<option value="${lg}">${leagues[lg].name}</option>`).join('');
+
+  function renderTeams(){
+    const lg = leagueEl.value;
+    const teams = Array.from((leagues[lg] || {teams:new Set()}).teams).filter(Boolean).sort((a,b)=>a.localeCompare(b));
+    const opts = teams.map(t=>`<option value="${t}">${t}</option>`).join('');
+    homeEl.innerHTML = opts;
+    awayEl.innerHTML = opts;
+    if(awayEl.value === homeEl.value && teams.length > 1){ awayEl.value = teams[1]; }
+  }
+
+  function renderPrediction(){
+    const key = `${leagueEl.value}||${homeEl.value}||${awayEl.value}`;
+    const r = rowMap[key];
+    if(!r){
+      outEl.innerHTML = "No prediction cached for this pairing in the selected league.";
+      return;
+    }
+    const pH = (r.prob_h || 0) * 100;
+    const pD = (r.prob_d || 0) * 100;
+    const pA = (r.prob_a || 0) * 100;
+    outEl.innerHTML = `xG: <b>${r.home} ${Number(r.h_xg||0).toFixed(2)}</b> vs <b>${Number(r.a_xg||0).toFixed(2)} ${r.away}</b> · Fair odds 1X2: <b>H ${Number(r.odds_h||0).toFixed(2)}</b> / <b>D ${Number(r.odds_d||0).toFixed(2)}</b> / <b>A ${Number(r.odds_a||0).toFixed(2)}</b> · Model probs: H ${pH.toFixed(1)}% · D ${pD.toFixed(1)}% · A ${pA.toFixed(1)}% · Conf ${Number(r.confidence||0).toFixed(2)}`;
+  }
+
+  leagueEl.addEventListener('change', ()=>{ renderTeams(); renderPrediction(); });
+  homeEl.addEventListener('change', renderPrediction);
+  awayEl.addEventListener('change', renderPrediction);
+
+  if(lgKeys.length){
+    leagueEl.value = lgKeys[0];
+    renderTeams();
+    renderPrediction();
+  }else{
+    outEl.textContent = 'No hypothetical fixture data available.';
+  }
+}
+
+setupFixturesSorting();
+setupHypotheticalTool();
 setTab('grouped');
 """)
     parts.append("</script>")
@@ -2820,6 +3029,39 @@ setTab('grouped');
     return out_path
 
 
+
+
+def apply_portfolio_constraints(value_bets, max_bets_per_day=3):
+    """Limit bets per day using bet_score (fallback EV) ranking."""
+    bets = list(value_bets or [])
+    if max_bets_per_day is None:
+        return bets
+    try:
+        cap = int(max_bets_per_day)
+    except Exception:
+        cap = 0
+    if cap <= 0:
+        return bets
+
+    by_day = {}
+    for b in bets:
+        d = str(b.get('date', '') or '')
+        by_day.setdefault(d, []).append(b)
+
+    kept = []
+    for d in sorted(by_day.keys()):
+        rows = by_day[d]
+        rows.sort(key=lambda x: (-(float(x.get('bet_score', 0) or 0)), -(float(x.get('ev', 0) or 0))))
+        kept.extend(rows[:cap])
+
+    kept.sort(key=lambda x: (
+        x.get('date', '9999-12-31'),
+        str(x.get('kickoff', '') or ''),
+        -(float(x.get('bet_score', 0) or 0)),
+        -(float(x.get('ev', 0) or 0)),
+    ))
+    return kept
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -2831,7 +3073,22 @@ parser.add_argument("--retrain", action="store_true", help="Force retraining mod
 parser.add_argument("--backtest", action="store_true", help="Run backtests (can be slow)")
 parser.add_argument("--html", action="store_true", help="Write HTML report to output/value_bets.html")
 parser.add_argument("--html-out", default="output/value_bets.html", help="HTML output file")
+parser.add_argument("--csv-out", default="output/value_bets.csv", help="CSV output file for value bets")
+parser.add_argument("--bankroll", type=float, default=1000.0, help="Bankroll used to convert stake %% into units")
+parser.add_argument("--max-bets-per-day", type=int, default=3, help="Portfolio cap: keep top N bets per day by bet score")
+parser.add_argument("--min-edge-pp", type=float, default=MIN_EDGE_PP, help="Override minimum model edge (percentage points)")
+parser.add_argument("--max-value-odds", type=float, default=MAX_VALUE_ODDS, help="Override max market odds allowed for value")
+parser.add_argument("--kelly-fraction", type=float, default=KELLY_FRACTION, help="Override Kelly fraction for stake sizing")
+parser.add_argument("--max-stake-pct", type=float, default=MAX_STAKE_PCT*100.0, help="Override max stake cap as bankroll %%")
+parser.add_argument("--min-confidence", type=float, default=MIN_CONFIDENCE, help="Override minimum confidence for value picks")
 args = parser.parse_args()
+
+# Runtime risk-control overrides
+MIN_EDGE_PP = float(args.min_edge_pp)
+MAX_VALUE_ODDS = float(args.max_value_odds)
+KELLY_FRACTION = float(args.kelly_fraction)
+MAX_STAKE_PCT = float(args.max_stake_pct) / 100.0
+MIN_CONFIDENCE = float(args.min_confidence)
 
 print("="*60)
 print("FOOTBALL BETTING MODEL v3.0")
@@ -3028,19 +3285,36 @@ for league, fixtures in fixtures_data.items():
                         'top_books': top_books,
                         'model_prob': float((pred.get('probs', {}) or {}).get(v['out'], 0) or 0),
                         'market_prob': (1.0 / float(v.get('mkt_o', 0) or 0)) if float(v.get('mkt_o', 0) or 0) > 0 else 0.0,
-                        'edge_pp': (float((pred.get('probs', {}) or {}).get(v['out'], 0) or 0) - ((1.0 / float(v.get('mkt_o', 0) or 0)) if float(v.get('mkt_o', 0) or 0) > 0 else 0.0)) * 100.0,
+                        'edge_pp': float(v.get('edge_pp', 0) or 0),
+                        'stake_pct': float(v.get('stake_pct', 0) or 0),
+                        'kelly_full_pct': float(v.get('kelly_full_pct', 0) or 0),
+                        'confidence': float(v.get('confidence', 0) or 0),
+                        'bet_score': float(v.get('bet_score', 0) or 0),
+                        'stake_units': (float(args.bankroll) * float(v.get('stake_pct', 0) or 0) / 100.0),
                     })
         except Exception:
             pass
 
+# Apply portfolio constraints (top-N per day)
+all_value_bets = apply_portfolio_constraints(all_value_bets, max_bets_per_day=args.max_bets_per_day)
+
+# Optional CSV export
+if all_value_bets:
+    try:
+        os.makedirs(os.path.dirname(args.csv_out), exist_ok=True)
+        pd.DataFrame(all_value_bets).to_csv(args.csv_out, index=False)
+        print(f"\nCSV value bets written to: {args.csv_out}")
+    except Exception as e:
+        print(f"\nCSV export failed: {e}")
+
 # Final Summary
 print("\n" + "="*60)
-print("ALL VALUE BETS (EV >= 5%)")
+print("ALL VALUE BETS (EV + edge + odds + confidence)")
 print("="*60)
 
 if all_value_bets:
-    # Sort by EV
-    all_value_bets.sort(key=lambda x: -x['ev'])
+    # Sort by composite quality score (then EV)
+    all_value_bets.sort(key=lambda x: (-(float(x.get('bet_score', 0) or 0)), -(float(x.get('ev', 0) or 0))))
 
     # Group by country -> league
     by_country = {}
@@ -3058,7 +3332,7 @@ if all_value_bets:
                     f"    {vb['date']} {vb['home']} vs {vb['away']}: "
                     f"{vb['bet']} @ {vb['odds']:.2f} (EV: {vb['ev']:+.1f}%) "
                     f"| Fair: {vb.get('fair_odds', vb.get('model_odds', 0)):.2f} "
-                    f"| xG: {vb.get('h_xg', 0):.2f} v {vb.get('a_xg', 0):.2f}"
+                    f"| xG: {vb.get('h_xg', 0):.2f} v {vb.get('a_xg', 0):.2f} | Stake: {vb.get('stake_units', 0):.2f}"
                 )
 
     print(f"\nTotal value bets found: {len(all_value_bets)}")
@@ -3067,9 +3341,51 @@ else:
 
 # Optional HTML output (always write when requested, even if no bets)
 if args.html:
+    # Build hypothetical fixture predictions (all pairings within each league)
+    hypothetical_fixtures = []
+    for league_code in sorted(models.keys()):
+        try:
+            model_h = models.get(league_code)
+            df_hist = historical_data.get(league_code)
+            if model_h is None or df_hist is None or len(df_hist) == 0:
+                continue
+            df_hist = df_hist.dropna(subset=['FTHG', 'FTAG', 'HomeTeam', 'AwayTeam']).copy()
+            if len(df_hist) < MIN_TRAIN_MATCHES:
+                continue
+            teams = sorted(set(df_hist['HomeTeam'].dropna().astype(str)).union(set(df_hist['AwayTeam'].dropna().astype(str))))
+            for ht in teams:
+                for at in teams:
+                    if ht == at:
+                        continue
+                    pred_h = model_h.predict(ht, at, df_hist)
+                    if pred_h is None:
+                        continue
+                    hypothetical_fixtures.append({
+                        'league': league_code,
+                        'league_name': model_h.name,
+                        'home': ht,
+                        'away': at,
+                        'h_xg': float(pred_h.get('h_xg', 0) or 0),
+                        'a_xg': float(pred_h.get('a_xg', 0) or 0),
+                        'odds_h': float((pred_h.get('odds', {}) or {}).get('H', 0) or 0),
+                        'odds_d': float((pred_h.get('odds', {}) or {}).get('D', 0) or 0),
+                        'odds_a': float((pred_h.get('odds', {}) or {}).get('A', 0) or 0),
+                        'prob_h': float((pred_h.get('probs', {}) or {}).get('H', 0) or 0),
+                        'prob_d': float((pred_h.get('probs', {}) or {}).get('D', 0) or 0),
+                        'prob_a': float((pred_h.get('probs', {}) or {}).get('A', 0) or 0),
+                        'confidence': float(pred_h.get('confidence', 0) or 0),
+                    })
+        except Exception:
+            continue
+
     # Force the output to 'index.html' so it works with GitHub Pages
     target_path = "output/index.html"
-    out_file = write_html_report(all_value_bets, all_fixture_preds, out_path=target_path)
+    out_file = write_html_report(
+        all_value_bets,
+        all_fixture_preds,
+        out_path=target_path,
+        hypothetical_fixtures=hypothetical_fixtures,
+    )
     print(f"\nHTML report written to: {out_file}")
 
 # Backtest Summary
