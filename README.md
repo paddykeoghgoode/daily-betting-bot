@@ -10,7 +10,7 @@ Automated football model report generator with GitHub Pages deployment.
 ## Where to link your report
 Use your GitHub Pages URL:
 
-`https://<your-github-username>.github.io/<your-repo-name>/`
+`[https://paddykeoghgoode.github.io/daily-betting-bot/](https://paddykeoghgoode.github.io/daily-betting-bot/)
 
 For this repository, once Actions has deployed, the link will be the root of the published `output` folder (the `index.html` report).
 
